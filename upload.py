@@ -3,7 +3,7 @@
 """一键发布：把 7fa4_terminal.py 传到 SFTP 的 /share/terminal.py，并推送到 git 远程。
 
 用法：
-    python upload.py                      # 上传 + 提交 + 推送（默认 lorigin/main）
+    python upload.py                      # 上传 + 提交 + 推送（默认 origin/main）
     python upload.py --no-git             # 只上传 SFTP
     python upload.py --no-sftp            # 只推 git
     python upload.py --dry-run            # 只打印将要做的事，不落地
@@ -15,7 +15,7 @@
        （%APPDATA%\\7fa4_terminal\\config.json，可用 --config 或 7FA4_CONFIG 覆盖）
     4. 交互输入（密码用 getpass，不回显）
 
-git 部分：仓库默认取脚本所在目录，远程默认 lorigin，不存在时回退 origin；
+git 部分：仓库默认取脚本所在目录，远程默认 origin（可用 --remote 改）；
 分支默认 main；有改动才提交，推送用 HEAD:<branch>，不切换当前分支。
 """
 
@@ -31,8 +31,7 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENTRY_NAME = "7fa4_terminal.py"
 DEFAULT_REMOTE_PATH = "/share/terminal.py"
-DEFAULT_REMOTE = "lorigin"
-FALLBACK_REMOTE = "origin"
+DEFAULT_REMOTE = "origin"
 DEFAULT_BRANCH = "main"
 REMOTE_MODE = 0o644
 
@@ -263,11 +262,8 @@ def pick_remote(name):
     remotes = git_out("remote").split()
     if name in remotes:
         return name
-    if FALLBACK_REMOTE in remotes:
-        print(f"[警告] 远程 {name} 不存在，改用 {FALLBACK_REMOTE}")
-        return FALLBACK_REMOTE
-    raise SystemExit(f"[错误] 没有可用的 git 远程（已找过 {name} / {FALLBACK_REMOTE}）。"
-                     f"先执行：git remote add {name} <仓库地址>")
+    raise SystemExit(f"[错误] 远程 {name} 不存在（现有：{'、'.join(remotes) or '无'}）。"
+                     f"先执行：git remote add {name} <仓库地址>，或用 --remote 指定")
 
 
 def git_publish(args):
@@ -341,7 +337,7 @@ def build_parser():
     p.add_argument("--config", help="指定 config.json 路径")
 
     p.add_argument("--remote", default=DEFAULT_REMOTE,
-                   help=f"git 远程名（默认 {DEFAULT_REMOTE}，不存在则回退 {FALLBACK_REMOTE}）")
+                   help=f"git 远程名（默认 {DEFAULT_REMOTE}）")
     p.add_argument("--branch", default=DEFAULT_BRANCH, help=f"推送分支（默认 {DEFAULT_BRANCH}）")
     p.add_argument("-m", "--message", help="提交信息（默认自动生成时间戳）")
     p.add_argument("--init", action="store_true", help="当前目录不是仓库时自动 git init")

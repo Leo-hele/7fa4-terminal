@@ -22,7 +22,7 @@
 | `run <题>` | 本地编译（Windows / Linux 通用）并在样例上跑 |
 | `paper` | 纸面题答案图片：`get` 备份 / `submit` 上传 / `restore` 还原 |
 | `export <题>` | 题面 markdown 导出 PNG（本地图片一起嵌入） |
-| `sftp` | SFTP 存储：`login/ls/pwd/cd/lcd/get/put/mkdir/rm/rmdir` |
+| `sftp` | SFTP 存储（5307）：`login/ls/pwd/cd/lcd/lpwd/get/put/mkdir/rm/rmdir` |
 | `template` | 查看/设置代码模板（`{{id}} {{no}} {{title}} {{short}} {{url}} {{date}}`） |
 | `config` | 查看/修改本地配置 |
 | `get` / `post` / `raw` | 直接发 HTTP 请求 |
@@ -88,6 +88,7 @@ python 7fa4_terminal.py --help
 7fa4 run Q6.4.6.1                   # 本地跑样例
 7fa4 submit Q6.4.6.1 -l cpp17       # 提交
 7fa4 export Q6.4.6.1                # 题面导出 PNG
+7fa4 sftp login                     # SFTP 存取（5307），详见下文
 ```
 
 外站题（vjudge 代收的题）：
@@ -99,6 +100,53 @@ python 7fa4_terminal.py --help
 7fa4 submit Q6.5.5.1 --via 7fa4                # 改走站点代理（需要验证码）
 7fa4 push Q6.5.5.1 --rid 73684626              # 手动同步某次 AC
 ```
+
+## SFTP 存取
+
+服务器 5307 端口（SFTPGo），登录一次后账号密码写入 `config.json`，之后不用再输：
+
+```bash
+7fa4 sftp login                     # 交互输入账号密码
+7fa4 sftp login -u 用户名 -p 密码
+```
+
+**本地暂存目录**默认是项目下的 `sftp/`（首次使用自动创建）。`put` 的相对路径从这里找文件，
+`get` 不指定本地路径时也落到这里；要传别处的文件就写 `./xxx` 或绝对路径：
+
+```bash
+7fa4 sftp lcd                  # 切换本地暂存目录（默认 ./sftp）
+7fa4 sftp lpwd                 # 查看本地暂存目录
+```
+
+**远程当前目录**用 `cd` 切换，记在 `config.json` 的 `sftp_cwd`，之后的相对路径都按它解析：
+
+```bash
+7fa4 sftp cd share             # -> /share
+7fa4 sftp cd latex             # -> /share/latex
+7fa4 sftp cd ../OI-wiki        # -> /share/OI-wiki
+7fa4 sftp cd /                 # 回根目录
+7fa4 sftp pwd                  # 当前远程目录
+```
+
+常用操作：
+
+```bash
+7fa4 sftp ls                   # 列当前远程目录
+7fa4 sftp ls latex/            # 也接受相对/绝对路径
+7fa4 sftp put test.cpp         # ./sftp/test.cpp -> <cwd>/test.cpp
+7fa4 sftp put test.cpp bak/    # 目标是已存在目录时自动拼上文件名
+7fa4 sftp get a.out            # <cwd>/a.out -> ./sftp/a.out
+7fa4 sftp get a.out D:\tmp\    # 指定本地目录
+7fa4 sftp mkdir proj           # 远程建目录（相对 cwd）
+7fa4 sftp rmdir proj / rm a.out
+```
+
+路径规则：
+
+- 远程：`/` 或 `~` 开头按绝对路径，其它相对 `sftp_cwd`
+- 本地：绝对路径或 `./` 开头按当前工作目录，其它相对路径落到 `sftp/`
+
+`cd` 会先校验目标存在且是目录；`ls` 输出目录优先，带大小和修改时间。
 
 ## 配置
 
@@ -131,7 +179,7 @@ python 7fa4_terminal.py --help
 
 ## 发布新版本
 
-`upload.py` 把主程序上传到 SFTP 的 `/share/terminal.py`，并推送到 git 远程（默认 `lorigin`，不存在时回退 `origin`，分支 `main`）。
+`upload.py` 把主程序上传到 SFTP 的 `/share/terminal.py`，并推送到 git 远程 `origin/main`（可用 `--remote` / `--branch` 改）。
 
 ```bash
 python upload.py                          # 语法检查 -> 上传 -> commit -> push
@@ -159,10 +207,11 @@ install.py          安装程序（依赖 + 7fa4 命令）
 upload.py           发布工具（SFTP + git）
 README.md
 template.cpp        代码模板示例
-problems/           pull 下来的题目（题面、样例、代码）
+problems/           pull 下来的题目（题面、样例、代码、图片）
+sftp/               SFTP 本地暂存目录（put 上传 / get 下载）
 ```
 
-`problems/`、`__pycache__/`、本地 `config.json` 不入库，见 `.gitignore`。
+`problems/`、`sftp/`、`templates/`、`__pycache__/`、本地 `config.json` 不入库，见 `.gitignore`。
 
 ## 常见问题
 
@@ -172,6 +221,8 @@ problems/           pull 下来的题目（题面、样例、代码）
 
 **`sftp` 命令报缺少 paramiko？** `python -m pip install paramiko`，或 `python install.py --paramiko`。
 
-**推送失败 `non-fast-forward`？** 远程有新提交，先 `git pull lorigin main` 再 `python upload.py`；认证问题检查 git 凭据或改用带 token 的 https 地址。
+**推送失败 `non-fast-forward`？** 远程有新提交，先 `git pull origin main` 再 `python upload.py`；认证问题检查 git 凭据或改用带 token 的 https 地址。
+
+**提示远程不存在？** 默认用 `origin`，远程叫别的名字时用 `--remote <名字>`，或先 `git remote add origin <仓库地址>`。
 
 **`7fa4` 命令找不到？** 命令目录不在 PATH，按安装程序末尾的提示加入 PATH 后重开终端。
