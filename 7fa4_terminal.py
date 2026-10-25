@@ -1993,6 +1993,22 @@ def cmd_config(args):
             cfg[key] = value
         save_config(cfg)
         print(f"[OK] 已写入 {CONFIG_FILE}")
+    elif action == "get":
+        if not args.items:
+            print("用法: config get <键> [键 ...]")
+            return 1
+        for key in args.items:
+            if key not in cfg:
+                print(f"[缺失] {key}")
+                continue
+            value = cfg[key]
+            if not args.raw and key in ("vj_cookie", "sftp_password", "sftp_user"):
+                print(f"{key} = ***")
+            elif isinstance(value, (dict, list)):
+                print(f"{key} = {json.dumps(value, ensure_ascii=False)}")
+            else:
+                print(f"{key} = {value}")
+        return 0
     elif action == "unset":
         for key in args.items:
             cfg.pop(key, None)
@@ -3032,8 +3048,8 @@ def build_parser():
     p.set_defaults(func=cmd_task)
 
     p = sub.add_parser("config", parents=[cfgopt], help="查看/修改本地配置（host、vj_cookie、template、sessions）")
-    p.add_argument("action", nargs="?", default="show", choices=["show", "set", "unset"])
-    p.add_argument("items", nargs="*", metavar="k=v", help="set/unset 的键值")
+    p.add_argument("action", nargs="?", default="show", choices=["show", "get", "set", "unset"])
+    p.add_argument("items", nargs="*", metavar="k=v", help="get 的键名；set 的 k=v；unset 的键名")
     p.add_argument("--raw", action="store_true", help="显示未打码的原文")
     p.set_defaults(func=cmd_config)
 
