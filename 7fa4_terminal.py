@@ -2024,7 +2024,8 @@ def cmd_config(args):
     print("可用键：host（站点）、language（默认提交语言，如 cpp17）、"
           "vj_cookie / vj_user（vjudge）、template（代码模板）、sessions（各站点登录态，自动维护）、"
           "sftp_host / sftp_port / sftp_user / sftp_password / sftp_key / "
-          "sftp_cwd（远程当前目录）/ sftp_local（本地 sftp 目录）")
+          "sftp_cwd（远程当前目录）/ sftp_local（本地 sftp 目录）、"
+          "update_url / auto_update（off|check|apply）/ update_interval（秒）")
     return 0
 
 
@@ -2907,6 +2908,125 @@ def cmd_shell(args):
 
 
 # ---------------------------------------------------------------- argparse
+# ---------------------------------------------------------------- 自动更新
+DEFAULT_UPDATE_URL = "http://localhost:9080/terminal.py"
+
+
+def self_file():
+    return os.path.abspath(__file__)
+
+
+def read_self_bytes():
+    try:
+        with open(self_file(), "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def fetch_remote_script(url, timeout=8.0):
+    try:
+        r = requests.get(url, timeout=timeout)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"拉取失败：{type(exc).__name__}: {exc}") from exc
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    if not r.content.strip():
+        raise RuntimeError("远端文件是空的")
+    return r.content
+
+
+def apply_update(content):
+    """语法校验后原子替换自身，旧文件留 .bak 备份。"""
+    path = self_file()
+    tmp = path + ".new"
+    with open(tmp, "wb") as f:
+        f.write(content)
+    try:
+        compile(content, path, "exec")
+    except SyntaxError as exc:
+        os.remove(tmp)
+        raise RuntimeError(f"新版本语法错误（第 {exc.lineno} 行）：{exc.msg}")
+    backup = path + ".bak"
+    try:
+        shutil.copyfile(path, backup)
+    except OSError:
+        backup = ""
+    os.replace(tmp, path)
+    return backup
+
+
+def update_url_of(args=None):
+    return (getattr(args, "url", None)
+            or load_config().get("update_url")
+            or DEFAULT_UPDATE_URL)
+
+
+def cmd_update(args):
+    url = update_url_of(args)
+    print(f"[更新] 源：{url}")
+    try:
+        remote = fetch_remote_script(url, args.timeout)
+    except RuntimeError as exc:
+        print(f"[更新] {exc}")
+        return 1
+    local = read_self_bytes()
+    if remote == local:
+        print("[更新] 已是最新版本")
+        return 0
+    print(f"[更新] 发现新版本：远端 {len(remote)} 字节，本地 {len(local)} 字节")
+    if args.check:
+        print("[更新] 去掉 --check 即可应用")
+        return 0
+    try:
+        backup = apply_update(remote)
+    except (RuntimeError, OSError) as exc:
+        print(f"[更新] 应用失败：{exc}")
+        return 1
+    print(f"[更新] 已更新 {self_file()}" + (f"，备份 {backup}" if backup else ""))
+    print("[更新] 重新执行命令即生效")
+    return 0
+
+
+def auto_update_check():
+    """按 config 的 auto_update 策略检查：off / check（默认，只提示）/ apply。"""
+    cfg = load_config()
+    mode = str(cfg.get("auto_update") or "check").strip().lower()
+    if mode in ("off", "0", "false", "no", "none"):
+        return
+    try:
+        interval = float(cfg.get("update_interval") or 21600)
+    except (TypeError, ValueError):
+        interval = 21600
+    now = time.time()
+    try:
+        last = float(cfg.get("update_checked_at") or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if now - last < interval:
+        return
+    cfg["update_checked_at"] = int(now)
+    try:
+        save_config(cfg)
+    except OSError:
+        pass
+    url = cfg.get("update_url") or DEFAULT_UPDATE_URL
+    try:
+        remote = fetch_remote_script(url, 2.0)
+    except RuntimeError:
+        return
+    if remote == read_self_bytes():
+        return
+    if mode == "apply":
+        try:
+            apply_update(remote)
+            print("[更新] 已自动更新到新版本，重新执行命令生效")
+        except (RuntimeError, OSError) as exc:
+            print(f"[更新] 自动更新失败：{exc}")
+    else:
+        print(f"[更新] 有新版本（{len(remote)} 字节），运行 update 应用")
+
+
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--host", default=None,
@@ -3053,6 +3173,13 @@ def build_parser():
     p.add_argument("--raw", action="store_true", help="显示未打码的原文")
     p.set_defaults(func=cmd_config)
 
+    p = sub.add_parser("update", parents=[cfgopt],
+                       help="检查并更新自身（默认 http://localhost:9080/terminal.py）")
+    p.add_argument("--check", action="store_true", help="只检查不应用")
+    p.add_argument("--url", help="更新源地址（默认读 config 的 update_url）")
+    p.add_argument("--timeout", type=float, default=8.0, help="下载超时秒数，默认 8")
+    p.set_defaults(func=cmd_update)
+
     p = sub.add_parser("get", parents=[common, output, cfgopt], help="发送 GET 请求")
     p.add_argument("path", help="请求路径，如 /problems")
     p.set_defaults(func=cmd_get)
@@ -3087,6 +3214,8 @@ def main(argv=None):
     if not getattr(args, "func", None):
         parser.print_help()
         return 0
+    if getattr(args, "action", None) != "update":
+        auto_update_check()
     try:
         return args.func(args)
     except KeyboardInterrupt:

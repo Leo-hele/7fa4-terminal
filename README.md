@@ -24,7 +24,8 @@
 | `export <题>` | 题面 markdown 导出 PNG（本地图片一起嵌入） |
 | `sftp` | SFTP 存储（5307）：`login/ls/pwd/cd/lcd/lpwd/get/put/mkdir/rm/rmdir` |
 | `template` | 查看/设置代码模板（`{{id}} {{no}} {{title}} {{short}} {{url}} {{date}}`） |
-| `config` | 查看/修改本地配置 |
+| `config` | 查看/修改本地配置（`show/get/set/unset`） |
+| `update` | 从 `update_url`（默认 `http://localhost:9080/terminal.py`）检查并更新自身 |
 | `get` / `post` / `raw` | 直接发 HTTP 请求 |
 | `shell` | 交互式终端 |
 
@@ -169,6 +170,10 @@ python 7fa4_terminal.py --help
 | `sessions` | 各站点登录态（自动维护） |
 | `sftp_host` / `sftp_port` / `sftp_user` / `sftp_password` / `sftp_key` | SFTP 连接信息 |
 | `sftp_cwd` / `sftp_local` | SFTP 远程当前目录 / 本地暂存目录 |
+| `update_url` | 自动更新源，默认 `http://localhost:9080/terminal.py` |
+| `auto_update` | `off` / `check`（默认，只提示）/ `apply`（自动替换） |
+| `update_interval` | 自动检查间隔秒数，默认 `21600`（6 小时） |
+| `update_checked_at` | 上次检查时间戳（程序自动维护） |
 
 ```bash
 7fa4 config                            # 查看（敏感字段打码）
@@ -176,6 +181,35 @@ python 7fa4_terminal.py --help
 7fa4 config set language=cpp17         # 写
 7fa4 config unset vj_cookie            # 删
 ```
+
+## 自动更新
+
+`7fa4_terminal.py` 可以从 `http://localhost:9080/terminal.py` 拉取新版本并替换自身：
+
+```bash
+7fa4 update                       # 检查 + 应用
+7fa4 update --check               # 只检查
+7fa4 update --url http://其他地址/terminal.py
+```
+
+工作方式：
+
+1. GET 远端文件，与本地字节比较，一致就报「已是最新」；
+2. 不一致时先写 `7fa4_terminal.py.new`，用 `compile()` 做语法校验，失败则删除临时文件、不动原文件；
+3. 通过校验后把原文件备份成 `7fa4_terminal.py.bak`，再 `os.replace` 原子替换；
+4. 提示「重新执行命令即生效」（当前进程仍跑旧代码）。
+
+启动时也会自动检查一次，策略由 `auto_update` 控制：
+
+```bash
+7fa4 config set auto_update=check     # 默认：只打印一行「有新版本，运行 update 应用」
+7fa4 config set auto_update=apply     # 有新版本直接替换
+7fa4 config set auto_update=off       # 完全不检查
+7fa4 config set update_interval=3600  # 改检查间隔（秒）
+```
+
+检查带 2 秒超时，失败静默忽略（离线也能正常用），并把 `update_checked_at` 写回配置避免频繁请求。
+`update` 子命令本身不会触发启动检查。
 
 ## 发布新版本
 
