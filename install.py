@@ -117,6 +117,7 @@ def install_command(target_dir, dry):
     log(f"[3/4] 生成命令 {path}")
     if dry:
         return path
+    os.makedirs(target_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(body)
     if os.name != "nt":
@@ -176,11 +177,14 @@ def main(argv=None):
     log("")
     log(f"[完成] 已安装命令：{path}")
     if not on_path(target_dir):
-        log(f"[提示] {target_dir} 不在 PATH 里，请把它加入 PATH 后重开终端")
+        log(f"[提示] {target_dir} 不在 PATH 里，把它加进去再重开终端，否则敲 7fa4 会 command not found")
         if os.name == "nt":
             log(f"       PowerShell: setx PATH \"$env:PATH;{target_dir}\"")
         else:
-            log(f"       bash/zsh: echo 'export PATH=\"{target_dir}:$PATH\"' >> ~/.profile")
+            shell = os.path.basename(os.environ.get("SHELL") or "")
+            rc = "~/.zshrc" if shell == "zsh" else "~/.bashrc"
+            log(f"       echo 'export PATH=\"{target_dir}:$PATH\"' >> {rc} && source {rc}")
+            log(f"       本次会话临时生效： export PATH=\"{target_dir}:$PATH\"")
     log("")
     log("下一步：")
     log("  7fa4 login -u 用户名 -p 密码     # 登录并保存会话")

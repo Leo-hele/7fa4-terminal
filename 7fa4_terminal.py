@@ -19,7 +19,8 @@
     run       编译并在样例上运行（本地对拍，Windows / Linux 通用）
     paper     纸面题答案图片：get 备份 / submit 上传 / restore 还原
     export    把题面 markdown 导出成 PNG（本地图片会一起嵌入）
-    sftp      SFTP 存储（5307 端口）：login/ls/pwd/get/put/mkdir/rm/rmdir
+    sftp      SFTP 存储（5307 端口）：login/ls/pwd/cd/lcd/get/put/mkdir/rm/rmdir
+              本地文件默认走项目下的 sftp/ 目录，cd 切换远程当前目录（记在 config）
     template  查看/设置自己的代码模板（占位符 {{id}} {{no}} {{title}} {{short}} {{url}} {{date}}）
     config    查看/修改本地配置（host / vj_cookie / template）
     get/post/raw  直接发 HTTP 请求

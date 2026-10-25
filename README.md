@@ -58,6 +58,20 @@ python install.py --uninstall     # 移除 7fa4 命令（不动依赖）
 setx PATH "$env:PATH;<上一步打印的目录>"
 ```
 
+Linux / macOS 说明：
+
+- 安装目录取 `python3 -m sysconfig` 的 `scripts` 目录（发行版 python 通常是 `/usr/local/bin`，一般要 root 才能写）。
+- 不可写时自动退回 `~/.local/bin`，生成文件名就是 `7fa4`（`chmod 755`，`#!/bin/sh` 启动器）。
+- `~/.local/bin` 默认不一定在 PATH（Ubuntu 的 `~/.profile` 只在目录已存在时才加入），安装程序会打印该执行的命令：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+7fa4 --help
+```
+
+- 也可以显式指定目录：`python3 install.py --dir ~/.local/bin`；装在 venv 里则用 venv 的 `bin` 目录。
+- 若装完 `7fa4` 报 `ModuleNotFoundError: requests`，说明启动器用的解释器缺依赖：`python3 -m pip install requests`（或 `--user`）。
+
 手动安装也可以：
 
 ```bash
