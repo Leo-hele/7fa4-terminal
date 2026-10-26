@@ -216,7 +216,8 @@ python 7fa4_terminal.py --help
 `upload.py` 把主程序上传到 SFTP 的 `/share/terminal.py`，并推送到 git 远程 `origin/main`（可用 `--remote` / `--branch` 改）。
 
 ```bash
-python upload.py                          # 语法检查 -> 上传 -> commit -> push
+python upload.py                          # 语法检查 -> 输入提交信息 -> 上传 -> commit -> push
+python upload.py -m "修复 xxx 的显示"      # 直接指定提交信息，不问
 python upload.py --no-git                 # 只传 SFTP
 python upload.py --no-sftp                # 只推 git
 python upload.py --dry-run                # 只打印计划
@@ -224,6 +225,9 @@ python upload.py --backup                 # 远程旧文件先备份成 .bak
 python upload.py --host 1.2.3.4 --user me # 临时指定 SFTP 账号
 python upload.py --save                   # 把本次 SFTP 账号写进 config.json
 ```
+
+提交信息：不给 `-m` 时会在发布前提示输入一行，直接回车用默认的
+`deploy: update terminal.py <时间>`，输入 `q` 取消；非交互环境（管道、CI）自动用默认值。
 
 SFTP 连接信息按优先级取：命令行 `--host/--port/--user/--password/--key` →
 环境变量 `SFTP_HOST/SFTP_PORT/SFTP_USER/SFTP_PASSWORD/SFTP_KEY` → `config.json` 的 `sftp_*` → 交互输入。

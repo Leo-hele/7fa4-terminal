@@ -3,7 +3,8 @@
 """一键发布：把 7fa4_terminal.py 传到 SFTP 的 /share/terminal.py，并推送到 git 远程。
 
 用法：
-    python upload.py                      # 上传 + 提交 + 推送（默认 origin/main）
+    python upload.py                      # 上传 + 提交 + 推送（默认 origin/main，运行中输入提交信息）
+    python upload.py -m "修复 xxx"        # 直接给提交信息，不询问
     python upload.py --no-git             # 只上传 SFTP
     python upload.py --no-sftp            # 只推 git
     python upload.py --dry-run            # 只打印将要做的事，不落地
@@ -339,7 +340,7 @@ def build_parser():
     p.add_argument("--remote", default=DEFAULT_REMOTE,
                    help=f"git 远程名（默认 {DEFAULT_REMOTE}）")
     p.add_argument("--branch", default=DEFAULT_BRANCH, help=f"推送分支（默认 {DEFAULT_BRANCH}）")
-    p.add_argument("-m", "--message", help="提交信息（默认自动生成时间戳）")
+    p.add_argument("-m", "--message", help="提交信息（不给则运行时交互输入，回车用默认）")
     p.add_argument("--init", action="store_true", help="当前目录不是仓库时自动 git init")
     p.add_argument("--force", action="store_true", help="推送使用 --force-with-lease（谨慎）")
 
@@ -350,14 +351,32 @@ def build_parser():
     return p
 
 
+def ask_message(args):
+    """提交信息：-m 直接用；否则交互输入一次，回车取默认；非交互（管道/CI）也走默认。"""
+    default = "deploy: update terminal.py " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    if args.message:
+        return args.message.strip()
+    if args.dry_run or not sys.stdin.isatty():
+        return default
+    print(f"提交信息（回车用「{default}」，输入 q 取消）：", end=" ")
+    try:
+        typed = sys.stdin.readline().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit("[已取消]")
+    if typed.lower() in ("q", "quit", "exit"):
+        raise SystemExit("[已取消]")
+    return typed or default
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.no_sftp and args.no_git:
         raise SystemExit("[错误] --no-sftp 与 --no-git 不能同时使用")
-    if not args.message:
-        args.message = "deploy: update terminal.py " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    args.message = ask_message(args)
 
     print(f"== 发布 {os.path.basename(args.file)} ==")
+    print(f"[commit] 提交信息：{args.message}")
     if not args.no_check:
         syntax_check(os.path.abspath(args.file))
         print("[check] 语法检查通过")
