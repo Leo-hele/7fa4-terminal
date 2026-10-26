@@ -16,7 +16,12 @@
     vjcheck   检查 vj_cookie 是否还有效
     task      继续查看某个 vjudge 任务（--via 7fa4 代理提交时会给任务号）
     tasks     列出 7FA4 上的 vjudge 任务
-    run       编译并在样例上运行（本地对拍，Windows / Linux 通用）
+    run       编译并在样例上运行（用户输出/错误写到 <名>.out / <名>.err）
+    submission 查看提交：状态用 /submissions/?id=123，代码用 /submission/123（会问是否继续）
+    submissions 提交记录查询：分页 + 题目/提交者/状态/语言/分数筛选
+    plan      计划按天读写：plan show 明天 / plan add 后天 -m "..." -p "71354"
+    review    比赛复盘表：add 记一场（自动带排名/总分/各题），list 查看，show 过滤
+    help      分级帮助：help 总览，help <命令> 看参数
     paper     纸面题答案图片：get 备份 / submit 上传 / restore 还原
     export    把题面 markdown 导出成 PNG（本地图片会一起嵌入）
     sftp      SFTP 存储（5307 端口）：login/ls/pwd/cd/lcd/get/put/mkdir/rm/rmdir
@@ -66,6 +71,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import time
 import urllib.parse
 import zipfile
@@ -187,6 +193,26 @@ def sanitize_name(name, default="problem"):
 
 def strip_tags(text):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+
+
+def disp_width(text):
+    """终端显示宽度：中文/全角算 2 列。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in str(text or ""))
+
+
+def pad(text, width, align="left"):
+    """按显示宽度补齐，超长按字符截断。"""
+    text = str(text or "")
+    if disp_width(text) > width:
+        cut = ""
+        for ch in text:
+            if disp_width(cut + ch) > width:
+                break
+            cut += ch
+        text = cut
+    gap = max(0, width - disp_width(text))
+    return (text + " " * gap) if align == "left" else (" " * gap + text)
 
 
 # ---------------------------------------------------------------- 配置 / 模板
@@ -2151,6 +2177,21 @@ def cmd_run(args):
             print(f"  [{idx}/{len(cases)}] {name}  TLE  >{args.time_limit:g}s")
             continue
 
+        # 用户输出 / 错误落到样例同目录：<名>.out、<名>.err
+        sample_dir = os.path.dirname(in_path)
+        stem = os.path.splitext(name)[0]
+        out_file = os.path.join(sample_dir, stem + ".out")
+        if expected and os.path.abspath(out_file) == os.path.abspath(expected):
+            out_file = os.path.join(sample_dir, stem + ".user.out")
+        err_file = os.path.join(sample_dir, stem + ".err")
+        try:
+            with open(out_file, "wb") as f:
+                f.write(p.stdout)
+            with open(err_file, "wb") as f:
+                f.write(p.stderr)
+        except OSError as exc:
+            print(f"      [警告] 写入输出失败：{exc}")
+
         if rc != 0:
             print(f"  [{idx}/{len(cases)}] {name}  RE  退出码 {rc}  {elapsed:.3f}s")
             if err.strip():
@@ -2184,6 +2225,7 @@ def cmd_run(args):
     if tmp_dir:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    print(f"[输出] 每组用户输出/错误写到样例同目录：<名>.out（无期望输出时）/ <名>.user.out / <名>.err")
     print(f"[结果] 通过 {passed}/{len(cases)}")
     return 0 if passed == len(cases) else 1
 
@@ -2329,6 +2371,671 @@ def cmd_paper(args):
 
     print(f"[错误] 未知操作：{args.action}")
     return 1
+
+
+# ---------------------------------------------------------------- 计划 / 复盘 / 提交详情
+def parse_home_plan(html):
+    """从首页解析「今日计划」：自由文本 + 表格（题号/题目/评价/期限）。"""
+    text = ""
+    m = re.search(r'<div class="user_plan_item">([\s\S]*?)</div>', html)
+    if m:
+        text = strip_tags(m.group(1))
+    rows = []
+    tbody = html.split('id="announces"', 1)
+    if len(tbody) > 1:
+        for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", tbody[1].split("</tbody>")[0]):
+            pid = re.search(r"/problem/(\d+)", tr)
+            if not pid:
+                continue
+            cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+            rows.append({"id": pid.group(1), "cells": cells})
+    return text, rows
+
+
+PLAN_DATE_WORDS = {
+    "today": 0, "今天": 0, "今晚": 0,
+    "tomorrow": 1, "明天": 1, "明早": 1,
+    "后天": 2, "大后天": 3,
+    "yesterday": -1, "昨天": -1,
+}
+
+
+def parse_plan_date(text, base=None):
+    """today / 明天 / 后天 / 2026-10-28 / 10-28 / +3 都能解析成 date。"""
+    base = base or datetime.date.today()
+    raw = (text or "").strip().lower()
+    if not raw:
+        return base
+    if raw in PLAN_DATE_WORDS:
+        return base + datetime.timedelta(days=PLAN_DATE_WORDS[raw])
+    m = re.fullmatch(r"([+-]?\d+)", raw)
+    if m:
+        return base + datetime.timedelta(days=int(m.group(1)))
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if m:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", raw)
+    if m:
+        return datetime.date(base.year, int(m.group(1)), int(m.group(2)))
+    raise RuntimeError(f"看不懂的日期：{text}（可用 today/tomorrow/后天/2026-10-28/+3）")
+
+
+def plan_timestamp(day):
+    return int(datetime.datetime.combine(day, datetime.time()).timestamp())
+
+
+def current_user_id(client):
+    """从首页导航里的 /user_plans/<uid> 拿用户 id，顺带缓存到 config。"""
+    cfg = load_config()
+    if cfg.get("user_id"):
+        return int(cfg["user_id"])
+    html = client.get("/").text
+    m = re.search(r"/user_plans/(\d+)", html)
+    if not m:
+        raise RuntimeError("没能从首页取到用户 ID（请确认已登录）")
+    cfg["user_id"] = int(m.group(1))
+    try:
+        save_config(cfg)
+    except OSError:
+        pass
+    return int(m.group(1))
+
+
+def fetch_user_plan(client, user_id, day, ptype="day"):
+    """GET /user_plan?format=json -> (user_plan 字典, 时间戳)"""
+    ts = plan_timestamp(day)
+    r = client.get("/user_plan", params={"format": "json", "user_id": user_id,
+                                         "date": ts, "type": ptype})
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"计划接口返回异常（HTTP {r.status_code}）：{r.text[:120]}")
+    if not data.get("success"):
+        raise RuntimeError(f"读取计划失败：{data.get('err') or data}")
+    return (data.get("user_plan") or {}), ts
+
+
+def cmd_plan(args):
+    """计划：home 看首页概览，show 看某天计划（默认今天），add 新建/修改某天计划。"""
+    client = make_client(args)
+    client.load_session()
+    action = (args.action or "show").lower()
+    ptype = (args.type or "day").lower()
+
+    if action == "home":
+        try:
+            html = client.get("/").text
+        except RuntimeError as exc:
+            print(f"[错误] {exc}")
+            return 1
+        text, rows = parse_home_plan(html)
+        print("[计划] 今日计划")
+        if text:
+            for line in text.splitlines() or [text]:
+                if line.strip():
+                    print(f"  {line.strip()}")
+        else:
+            print("  （还没有填写计划）")
+        if rows:
+            print(f"\n[计划] 作业 {len(rows)} 项")
+            for row in rows:
+                no = row["cells"][0] if row["cells"] else row["id"]
+                title = row["cells"][1] if len(row["cells"]) > 1 else ""
+                deadline = row["cells"][3] if len(row["cells"]) > 3 else ""
+                print(f"  {no:<12} {title:<18} 截止 {deadline}  ({row['id']})")
+        return 0
+
+    try:
+        day = parse_plan_date(args.date)
+        user_id = args.user or current_user_id(client)
+        existing, ts = fetch_user_plan(client, user_id, day, ptype)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+
+    weekday = "一二三四五六日"[day.weekday()]
+    if action == "show":
+        print(f"[计划] {day.isoformat()} 周{weekday}  {ptype}  用户 {user_id}")
+        if not existing:
+            print("  （这一天还没有计划）")
+            return 0
+        print(f"[编号] {existing.get('id')}")
+        plan = (existing.get("plan") or "").strip()
+        print("[描述] " + (plan.replace("\r\n", "\n").replace("\n", " / ") if plan else "（空）"))
+        pids = (existing.get("problem_ids") or "").split("|")
+        pids = [p for p in pids if p]
+        if pids:
+            print(f"[题目] {len(pids)} 道")
+            for pid in pids:
+                print(f"  {pid}")
+        else:
+            print("[题目] （无）")
+        for key, label in (("teacher_plan", "教师"), ("result", "完成"), ("tweak", "调整")):
+            value = (existing.get(key) or "").strip()
+            if value:
+                print(f"[{label}] {value.replace(chr(10), ' / ')}")
+        if existing.get("comment"):
+            print(f"[评语] {existing['comment']}")
+        return 0
+
+    if action in ("add", "edit"):
+        plan_text = args.message
+        if plan_text is None and args.file:
+            if not os.path.exists(args.file):
+                print(f"[错误] 文件不存在：{args.file}")
+                return 1
+            plan_text = read_text_any(args.file)
+        if plan_text is None:
+            print('用法: plan add [明天] -m "计划描述" [-p "71354 Q3.3.6.4"] [-r 完成情况] [-t 调整]')
+            return 1
+
+        # 站点要求 problem_ids 用 | 分隔（空格/逗号也帮你换掉）
+        problems = args.problems if args.problems is not None else (existing.get("problem_ids") or "")
+        problems = re.sub(r"[\s,，、]+", "|", problems.strip()).strip("|")
+
+        payload = {
+            "id": existing.get("id") or 0,
+            "type": ptype,
+            "date": ts,
+            "user_id": user_id,
+            "problem_ids": problems,
+            "plan": plan_text.strip(),
+            "result": (args.result if args.result is not None else existing.get("result") or ""),
+            "tweak": (args.tweak if args.tweak is not None else existing.get("tweak") or ""),
+        }
+        verb = "修改" if payload["id"] else "新建"
+        print(f"[计划] {verb} {day.isoformat()} 周{weekday}  {ptype}")
+        print(f"[计划] 题目：{payload['problem_ids'] or '（无）'}")
+        print(f"[计划] 描述：{payload['plan'][:80] or '（空）'}")
+        if args.dry_run:
+            print("[预演] 仅显示，不提交")
+            return 0
+        try:
+            r = client.request("post", "/user_plan", json=payload)
+        except RuntimeError as exc:
+            print(f"[错误] {exc}")
+            return 1
+        try:
+            data = r.json()
+        except ValueError:
+            print(f"[失败] HTTP {r.status_code}：{strip_tags(r.text)[:200]}")
+            return 1
+        if not data.get("success"):
+            print(f"[失败] {data.get('err') or data}")
+            return 1
+        print(f"[OK] 已{'修改' if payload['id'] else '创建'}计划 #{data.get('id') or payload['id']}")
+        return 0
+
+    print(f"[错误] 未知操作：{action}")
+    return 1
+
+
+def cmd_submissions(args):
+    """提交记录查询：/submissions 的筛选参数 + 分页（服务端内嵌 itemList）。"""
+    client = make_client(args)
+    client.load_session()
+
+    base_params = {}
+    if args.problem:
+        base_params["problem_id"] = args.problem
+    if args.submitter:
+        base_params["submitter"] = args.submitter
+    if args.status:
+        base_params["status"] = args.status
+    if args.language:
+        base_params["language"] = args.language
+    if args.min_score is not None:
+        base_params["min_score"] = args.min_score
+    if args.max_score is not None:
+        base_params["max_score"] = args.max_score
+
+    page = max(1, args.page)
+    total_pages = None
+    for _ in range(max(1, args.pages)):
+        params = dict(base_params, page=page)
+        try:
+            r = client.get("/submissions", params=params)
+        except RuntimeError as exc:
+            print(f"[错误] {exc}")
+            return 1
+        items = extract_json_array(r.text, "itemList") or []
+        if total_pages is None:
+            pages = [int(x) for x in re.findall(r"/submissions\?[^\"]*page=(\d+)", r.text)]
+            total_pages = max(pages) if pages else 1
+            filt = " ".join(f"{k}={v}" for k, v in base_params.items())
+            print(f"[提交] 第 {page}/{total_pages} 页  共 {len(items)} 条"
+                  + (f"  筛选：{filt}" if filt else ""))
+        else:
+            print(f"[提交] 第 {page}/{total_pages} 页  共 {len(items)} 条")
+        if not items:
+            print("  （没有更多记录）")
+            return 0
+        for item in items:
+            info = item.get("info") or {}
+            result = item.get("result") or {}
+            no = info.get("problemEid") or info.get("problemId") or "-"
+            title = info.get("problemName") or ""
+            who = info.get("nickname") or info.get("user") or ""
+            status = result.get("result") or ("评测中" if item.get("running") else "等待")
+            score = result.get("score")
+            score_txt = f"{score:.0f}" if isinstance(score, (int, float)) else "-"
+            print(f"  #{info.get('submissionId')}  {pad(no, 11)} {pad(title, 18)} {pad(who, 12)} "
+                  f"{pad(info.get('language') or '', 8)} {pad(status, 22)} "
+                  f"{pad(score_txt, 3, 'right')}  "
+                  f"{pad(str(result.get('time') or 0) + 'ms', 7, 'right')} "
+                  f"{pad(str(result.get('memory') or 0) + 'KB', 9, 'right')}  "
+                  f"{info.get('submitTime')}")
+        if args.pages > 1:
+            page += 1
+            if total_pages and page > total_pages:
+                break
+    return 0
+
+
+REVIEW_FILE = os.path.join(BASE_DIR, "reviews.md")
+REVIEW_HEADER = ("| 日期 | 比赛 | 排名 | 总分 | 各题 | 结论 | 复盘 |\n"
+                 "| --- | --- | --- | --- | --- | --- | --- |\n")
+REVIEW_COLS = 7
+
+
+def read_review_rows():
+    if not os.path.exists(REVIEW_FILE):
+        return []
+    rows = []
+    with open(REVIEW_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("|") or line.startswith("| ---") or "日期" in line:
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) >= REVIEW_COLS:
+                rows.append(cells[:REVIEW_COLS])
+    return rows
+
+
+def write_review_rows(rows):
+    body = "".join("| " + " | ".join(c.replace("|", "\\|") for c in row) + " |\n" for row in rows)
+    write_text(REVIEW_FILE, "# 复盘表\n\n" + REVIEW_HEADER + body)
+
+
+def parse_contest_rows(html):
+    """模测列表：id / 名称 / 状态 / 开始时间 / 时长。"""
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
+        m = re.search(r'href="/contest/(\d+)"[^>]*>([\s\S]*?)</a>', tr)
+        if not m:
+            continue
+        cid = m.group(1)
+        name = re.sub(r"\s*(已结束|未开始|进行中|已开始)\s*$", "", strip_tags(m.group(2))).strip()
+        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+        head = cells[0] if cells else ""
+        status = ("已结束" if "已结束" in head else "未开始" if "未开始" in head
+                  else "进行中" if "进行中" in head else "")
+        rows.append({"id": cid, "name": name, "status": status,
+                     "start": cells[1] if len(cells) > 1 else "",
+                     "duration": cells[2] if len(cells) > 2 else ""})
+    return rows
+
+
+def find_contest(client, token):
+    """按编号或名称找比赛，返回 (id, 名称, 状态, 开始时间)。"""
+    token = (token or "").strip()
+    rows = parse_contest_rows(client.get("/contests").text)
+    if token.isdigit():
+        for row in rows:
+            if row["id"] == token:
+                return row["id"], row["name"], row["status"], row["start"]
+        return token, "", "", ""
+    key = token.lower()
+    hit = [r for r in rows if key in r["name"].lower()]
+    if len(hit) == 1:
+        r = hit[0]
+        return r["id"], r["name"], r["status"], r["start"]
+    if not hit:
+        raise RuntimeError(f"没有匹配的比赛：{token}（可用 review list 看已记录的，或 list 看模测）")
+    listing = "\n".join(f"  {r['id']}  {r['name']}  {r['status']}  {r['start']}" for r in hit[:15])
+    raise RuntimeError(f"比赛 {token} 匹配到多个，请用编号：\n{listing}")
+
+
+def parse_contest_problems(html, cid):
+    """比赛页的题目：编号/字母+标题/我在这题的状态。"""
+    probs, seen = [], set()
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
+        m = re.search(r'href="/contest/%s/problem/(\d+)"[^>]*>([\s\S]*?)</a>' % cid, tr)
+        if not m:
+            continue
+        no, label = m.group(1), strip_tags(m.group(2))
+        if no in seen:
+            continue
+        seen.add(no)
+        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+        state = ""
+        for cell in cells:
+            for word in RESULT_WORDS:
+                if cell.startswith(word):
+                    state = word
+                    break
+            if state:
+                break
+        probs.append({"no": no, "label": label, "state": state})
+    probs.sort(key=lambda p: int(p["no"]) if p["no"].isdigit() else 0)
+    return probs
+
+
+def fetch_contest_summary(client, cid):
+    html = client.get(f"/contest/{cid}").text
+    title = ""
+    m = re.search(r"<h1[^>]*>([\s\S]*?)</h1>", html)
+    if m:
+        title = strip_tags(m.group(1))
+    if not title:
+        m = re.search(r"<title>(.*?)</title>", html, re.S)
+        if m:
+            title = strip_tags(m.group(1)).split("-")[0].strip()
+    return {"title": title, "problems": parse_contest_problems(html, cid)}
+
+
+def fetch_my_rank(client, cid, uid):
+    """排行榜里找自己：排名 / 每题得分与时间 / 总分。"""
+    html = client.get(f"/contest/{cid}/ranklist").text
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
+        if f"/user/{uid}" not in tr:
+            continue
+        tds = re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)
+        if len(tds) < 4:
+            continue
+
+        def score_of(cell):
+            m = re.search(r'class="score[^"]*"[^>]*>\s*([\d.]+)', cell)
+            t = re.search(r'class="submit_time"[^>]*>\s*([\d:]+)', cell)
+            return (m.group(1) if m else "-"), (t.group(1) if t else "")
+
+        per = [score_of(td) for td in tds[3:-1]]
+        total, total_time = score_of(tds[-1])
+        return {"rank": strip_tags(tds[0]), "per": per,
+                "total": total, "total_time": total_time}
+    return None
+
+
+def cmd_review(args):
+    """比赛复盘表：add 记一场（自动带成绩），list 看表，show 看某场。"""
+    action = (args.action or "list").lower()
+
+    if action == "add":
+        client = make_client(args)
+        client.load_session()
+        try:
+            cid, name, status, start = find_contest(client, args.contest)
+            summary = fetch_contest_summary(client, cid)
+            uid = args.user or current_user_id(client)
+            mine = fetch_my_rank(client, cid, uid)
+        except RuntimeError as exc:
+            print(f"[错误] {exc}")
+            return 1
+
+        name = name or summary.get("title") or cid
+        day = (start or "")[:10] or datetime.date.today().isoformat()
+        probs = summary.get("problems") or []
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        parts = []
+        for i, prob in enumerate(probs):
+            letter = re.sub(r"[^A-Za-z]", "", prob["label"].split(".")[0]) or letters[i:i + 1]
+            score = mine["per"][i][0] if (mine and i < len(mine["per"])) else "-"
+            parts.append(f"{letter}{score}")
+        detail = " ".join(parts)
+        rank_raw = (mine or {}).get("rank") or ""
+        rank = re.sub(r"[^\d]", "", rank_raw) or "-"
+        total = (mine or {}).get("total") or "-"
+
+        print(f"[比赛] {name}  {status or ''}  {start}".rstrip())
+        print(f"[成绩] 排名 {rank}  总分 {total}  各题 {detail or '-'}")
+        if not mine:
+            print("[提示] 排行榜里没找到你的成绩（可能没参加）")
+
+        note = args.note
+        if note is None:
+            try:
+                note = input("这一场的复盘（失误/教训，可空）: ")
+            except (EOFError, KeyboardInterrupt):
+                note = ""
+        row = [day, name, rank, total, detail or "-", args.verdict or "已复盘",
+               note.strip().replace("\n", "；")]
+        rows = [r for r in read_review_rows() if r[1] != name] + [row]
+        write_review_rows(rows)
+        print(f"[OK] 已写入 {REVIEW_FILE}（共 {len(rows)} 条）")
+        return 0
+
+    rows = read_review_rows()
+    if not rows:
+        print(f"[复盘] 还没有记录，用 review add <比赛编号或名称> -m \"失误与教训\" 记一场")
+        return 0
+
+    if action == "show":
+        key = (args.contest or "").lower()
+        rows = [r for r in rows if key in r[1].lower() or key in r[0]]
+        if not rows:
+            print(f"[复盘] 没有和 {args.contest} 相关的记录")
+            return 1
+
+    limit = args.limit or 20
+    shown = rows[-limit:]
+    print(f"[复盘] 共 {len(rows)} 条" + (f"，显示最近 {len(shown)} 条" if len(shown) < len(rows) else ""))
+    for day, name, rank, total, detail, verdict, note in shown:
+        print(f"  {day}  {pad(name, 20)} 第 {pad(rank, 4)} 总分 {pad(total, 5)} "
+              f"{pad(detail, 24)} {pad(verdict, 6)} {note}")
+    print(f"[文件] {REVIEW_FILE}")
+    return 0
+
+
+def extract_js_json(text, key):
+    """从 JS 源码里取 `key: {...}` 的 JSON（字符串感知地配对花括号）。"""
+    i = text.find(key + ":")
+    if i < 0:
+        return None
+    start = text.find("{", i)
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for j in range(start, len(text)):
+        ch = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:j + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def extract_json_array(text, marker):
+    """从 JS 源码里取 `marker:` 之后的 JSON 数组（字符串感知配对方括号）。"""
+    i = text.find(marker)
+    if i < 0:
+        return None
+    start = text.find("[", i)
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for j in range(start, len(text)):
+        ch = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:j + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def extract_js_string(text, name):
+    m = re.search(r'const %s = ("(?:[^"\\]|\\.)*")' % re.escape(name), text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except ValueError:
+        return None
+
+
+def fetch_submission_item(client, sid):
+    """状态走 /submissions/?id=xxx（页面里内嵌 itemList，只有一条）。"""
+    r = client.get("/submissions/", params={"id": sid})
+    items = extract_json_array(r.text, "itemList") or []
+    for item in items:
+        info = item.get("info") or {}
+        if str(info.get("submissionId")) == str(sid):
+            return item
+    return None
+
+
+def ask_continue(prompt):
+    """问用户继续还是停止；非交互环境按“停止”处理。"""
+    try:
+        answer = input(f"{prompt} [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes", "1")
+
+
+def cmd_submission(args):
+    """看某次提交：状态走 /submissions/?id=，代码走 /submission/<id>（必要时问是否继续）。"""
+    sid = str(args.sid or "").strip()
+    m = re.search(r"id=(\d+)", sid)
+    if m:
+        sid = m.group(1)
+    if not sid.isdigit():
+        print(f"[错误] 提交编号不合法：{args.sid}")
+        return 1
+
+    client = make_client(args)
+    client.load_session()
+    try:
+        item = fetch_submission_item(client, sid)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+
+    info = (item or {}).get("info") or {}
+    result = (item or {}).get("result") or {}
+    if info:
+        print(f"[提交] #{info.get('submissionId')}  {info.get('problemEid', '')} {info.get('problemName', '')}")
+        print(f"[信息] 题目 {info.get('problemId')}   {info.get('language')}   "
+              f"{info.get('codeSize')} 字符   提交 {info.get('submitTime')}")
+        print(f"[提交者] {info.get('nickname') or info.get('uid') or info.get('user')}"
+              f"（{info.get('user') or info.get('userId')}）")
+        if result:
+            print(f"[状态] {result.get('result') or '评测中'}  分数 {result.get('score')}  "
+                  f"用时 {result.get('time')} ms  内存 {result.get('memory')} KB")
+        else:
+            print("[状态] " + ("评测中…" if (item or {}).get("running") else "等待评测"))
+        print(f"[链接] {client.base}/submission/{sid}")
+    else:
+        print(f"[提示] /submissions/?id={sid} 里没有这条记录（可能是比赛内提交）")
+
+    if not (args.code or args.save):
+        print(f"[代码] 加 --code 显示，或 --save <文件> 保存")
+        return 0
+
+    # 看代码要走 /submission/<id>：别人的提交站点会报错，先问一句
+    my_uid = None
+    try:
+        my_uid = current_user_id(client)
+    except RuntimeError:
+        pass
+    owner = info.get("userId")
+    if owner and my_uid and str(owner) != str(my_uid) and not args.yes:
+        print(f"[提示] 这是 {info.get('nickname') or info.get('uid')} 的提交，"
+              f"代码页可能打不开（站点对他人提交会报错）")
+        if not ask_continue("仍要继续尝试读取代码？"):
+            print("[停止] 已取消")
+            return 0
+
+    try:
+        r = client.get(f"/submission/{sid}")
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+
+    code = extract_js_string(r.text, "unformattedCode")
+    if code is None:
+        if "错误 - 7FA4" in r.text:
+            msg = strip_tags(r.text.split("ui main container")[-1])[:200]
+            print(f"[失败] 代码页返回错误：{msg or '站点报错（他人提交或权限不足）'}")
+            if not args.yes and ask_continue("换个方式再试一次（重新请求）？"):
+                try:
+                    r = client.get(f"/submission/{sid}")
+                except RuntimeError as exc:
+                    print(f"[错误] {exc}")
+                    return 1
+                code = extract_js_string(r.text, "unformattedCode")
+        if code is None:
+            print("[代码] 取不到代码（他人提交 / 比赛内提交 / 纸面题答案图）")
+            return 1
+
+    if args.save:
+        path = args.save
+        if os.path.isdir(path):
+            path = os.path.join(path, f"submission{sid}.cpp")
+        write_text(path, code)
+        print(f"[代码] 已保存 -> {path}（{len(code)} 字符）")
+        return 0
+
+    if len(code) > args.max_chars and not args.yes:
+        if not ask_continue(f"代码有 {len(code)} 字符，继续显示？"):
+            print("[代码] 已跳过")
+            return 0
+
+    print("-" * 60)
+    print("\n".join(f"{i:>4}  {line}" for i, line in enumerate(code.splitlines(), 1)))
+    print("-" * 60)
+    return 0
+
+
+def cmd_help(args):
+    """分级帮助：help 看总览，help <命令> 看该命令的详细参数。"""
+    parser = build_parser()
+    topics = [t for t in (args.topic or []) if t]
+    if not topics:
+        parser.print_help()
+        return 0
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            sub = action.choices.get(topics[0])
+            if not sub:
+                print(f"[错误] 没有命令：{topics[0]}")
+                print("可用：" + " / ".join(sorted(action.choices)))
+                return 1
+            sub.print_help()
+            if len(topics) > 1:
+                print(f"\n（{topics[0]} 没有更深的子命令，用 {topics[0]} --help 看参数）")
+            return 0
+    return 0
 
 
 # ---------------------------------------------------------------- SFTP 存储（5307）
@@ -3106,6 +3813,55 @@ def build_parser():
     p.add_argument("--width", type=int, default=1000, help="画布宽度，默认 1000")
     p.add_argument("--preview", action="store_true", help="导出后在终端画个粗略预览")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("plan", parents=[common, cfgopt],
+                       help="计划：show 看某天 / add 写某天（today/明天/后天）")
+    p.add_argument("action", nargs="?", default="show", choices=["show", "add", "edit", "home"])
+    p.add_argument("date", nargs="?", help="today / 明天 / 后天 / 2026-10-28 / +3，默认今天")
+    p.add_argument("-m", "--message", help="计划描述（add）")
+    p.add_argument("-f", "--file", help="从文件读计划描述（add）")
+    p.add_argument("-p", "--problems", help='计划题目，空格或 | 分隔，如 "71354 Q3.3.6.4"')
+    p.add_argument("-r", "--result", help="完成情况")
+    p.add_argument("-t", "--tweak", help="调整和补充")
+    p.add_argument("--type", choices=["day", "week"], default="day", help="day 日计划（默认）/ week 周计划")
+    p.add_argument("--user", type=int, help="用户 ID（默认自己）")
+    p.add_argument("-n", "--dry-run", action="store_true", help="只显示将要提交的内容")
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("submissions", parents=[common, cfgopt],
+                       help="提交记录查询：分页 + 题目/提交者/状态/语言/分数筛选")
+    p.add_argument("--page", type=int, default=1, help="页码，默认 1")
+    p.add_argument("--pages", type=int, default=1, help="连续看多少页，默认 1")
+    p.add_argument("--problem", help="题目 ID，如 77425")
+    p.add_argument("--submitter", help="提交者（学号或用户名）")
+    p.add_argument("--status", help="状态，如 Accepted / Wrong Answer")
+    p.add_argument("--language", help="语言，如 cpp17")
+    p.add_argument("--min-score", type=int, dest="min_score", help="最低分")
+    p.add_argument("--max-score", type=int, dest="max_score", help="最高分")
+    p.set_defaults(func=cmd_submissions)
+
+    p = sub.add_parser("review", parents=[common, cfgopt],
+                       help="比赛复盘表：add 记一场（自动带排名/总分/各题得分）")
+    p.add_argument("action", nargs="?", default="list", choices=["add", "list", "show"])
+    p.add_argument("contest", nargs="?", help="比赛编号或名称关键字")
+    p.add_argument("-v", "--verdict", help="结论，如 正常/崩了/题读错")
+    p.add_argument("-m", "-n", "--note", dest="note", help="复盘内容（失误与教训）")
+    p.add_argument("--user", type=int, help="用户 ID（默认自己）")
+    p.add_argument("--limit", type=int, default=20, help="list 显示条数，默认 20")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("help", parents=[cfgopt], help="查看帮助（help 总览 / help <命令>）")
+    p.add_argument("topic", nargs="*", help="命令名，如 help sftp")
+    p.set_defaults(func=cmd_help, action="help")
+
+    p = sub.add_parser("submission", parents=[common, cfgopt],
+                       help="查看提交：状态走 /submissions/?id=，代码走 /submission/<id>")
+    p.add_argument("sid", help="提交编号，也接受 /submissions?id=123 这种写法")
+    p.add_argument("-c", "--code", action="store_true", help="显示代码（他人提交会先问是否继续）")
+    p.add_argument("-s", "--save", help="把代码保存到文件或目录")
+    p.add_argument("-y", "--yes", action="store_true", help="不再询问，直接尝试（他人提交/长代码）")
+    p.add_argument("--max-chars", type=int, default=2000, help="超过多少字符先确认，默认 2000")
+    p.set_defaults(func=cmd_submission)
 
     p = sub.add_parser("sftp", parents=[common, cfgopt],
                        help="SFTP 存储（5307 端口）：login/ls/pwd/cd/lcd/get/put/mkdir/rm/rmdir")

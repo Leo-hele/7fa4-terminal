@@ -19,7 +19,12 @@
 | `push <题>` | 把 vjudge 上已 AC 的记录同步到 7FA4，不重复提交 |
 | `vjlogin` / `vjcheck` | 用账号密码登录 vjudge / 检查会话是否有效 |
 | `task` / `tasks` | 查看 vjudge 任务 |
-| `run <题>` | 本地编译（Windows / Linux 通用）并在样例上跑 |
+| `run <题>` | 本地编译（Windows / Linux 通用）并在样例上跑，用户输出/错误写到 `<名>.out` / `<名>.err` |
+| `submission <编号>` | 看提交状态、分数、时间/内存，`--code` 显示代码、`--save` 存代码（也接受 `/submissions?id=123`） |
+| `submissions` | 提交记录查询：`--page/--pages` 分页，`--problem/--submitter/--status/--language/--min-score/--max-score` 筛选 |
+| `plan [show\\|add] [日期]` | 计划按天读写：`plan show 明天`、`plan add 后天 -m "..." -p "71354"`；`plan home` 看首页概览 |
+| `review` | **比赛复盘表**：`add <比赛>` 自动带排名/总分/各题得分，`list` 查看、`show <关键字>` 过滤 |
+| `help [命令]` | 分级帮助：`help` 总览，`help sftp` 看该命令参数 |
 | `paper` | 纸面题答案图片：`get` 备份 / `submit` 上传 / `restore` 还原 |
 | `export <题>` | 题面 markdown 导出 PNG（本地图片一起嵌入） |
 | `sftp` | SFTP 存储（5307）：`login/ls/pwd/cd/lcd/lpwd/get/put/mkdir/rm/rmdir` |
@@ -148,6 +153,55 @@ python 7fa4_terminal.py --help
 - 本地：绝对路径或 `./` 开头按当前工作目录，其它相对路径落到 `sftp/`
 
 `cd` 会先校验目标存在且是目录；`ls` 输出目录优先，带大小和修改时间。
+
+## 计划 / 复盘 / 提交详情
+
+```bash
+7fa4 plan                            # 今天的计划（描述 + 计划题目 + 教师计划 + 完成情况）
+7fa4 plan show 明天                   # 看明天的（也支持 后天 / yesterday / 2026-10-28 / +3）
+7fa4 plan add 明天 -m "树剖复习" -p "71354 Q3.3.6.4"   # 写明天的计划
+7fa4 plan add 后天 -m "线段树合并" -r "已完成 2/3" -t "剩余题明天补"
+7fa4 plan add 明天 -n                 # 只看将要提交的内容
+7fa4 plan home                       # 首页概览：今日计划文本 + 作业表（题号/题目/截止）
+
+7fa4 submissions                      # 最近 20 条提交
+7fa4 submissions --page 2 --pages 2   # 看第 2、3 页
+7fa4 submissions --problem 77425      # 只看某题
+7fa4 submissions --submitter 2025005011 --status Accepted   # 按人 + 状态
+7fa4 submissions --language cpp17 --min-score 90            # 按语言 + 分数
+
+7fa4 review add 23909 -v 正常 -m "B 题只拿 30，C 题 15，D 没做"
+7fa4 review add 乙模复四-2026-23 -v 崩了 -m "A 题读错题意"   # 名称关键字也行
+7fa4 review show 2026-23             # 按比赛名/日期过滤
+7fa4 review list                     # 表格形式查看（--limit N 控制条数）
+7fa4 review show 2026-23              # 按比赛名/日期过滤
+
+7fa4 submission 1048450              # 状态、分数、用时、内存、语言、提交者、提交时间
+7fa4 submission /submissions?id=1048450   # 也接受这种写法
+7fa4 submission 1048450 -c           # 显示代码（超过 2000 字符会先问 y/N，-y 跳过）
+7fa4 submission 1048450 -s problems/72874_inf/   # 代码存成 submission1048450.cpp
+```
+
+提交详情分两步请求：
+
+1. **状态**走 `/submissions/?id=<编号>`（页面内嵌 `itemList`，取那一条），别人的提交也能看；
+2. **代码**才进 `/submission/<编号>`。如果不是自己的提交，会先提示「这是 xx 的提交，代码页可能打不开」并问
+   继续 / 停止（`-y` 不再询问）。站点对他人提交的代码页会直接抛
+   `TypeError: ... reading 'is_owner'`，这时会打印该错误并说明取不到代码；
+   若第一次失败，会再问一次「换个方式再试一次（重新请求）？」，同样可以停下来。
+
+- 计划接口：读 `GET /user_plan?format=json&user_id=<uid>&date=<ts>&type=day`，写 `POST /user_plan`
+  （`{id, type, date, user_id, problem_ids, plan, result, tweak}`，`id` 为已有记录的编号）；`problem_ids` 用 `|` 分隔，
+  命令行里用空格/逗号写会自动转换；用户 id 首次从首页 `/user_plans/<uid>` 取到后缓存进配置
+- 提交记录页 `/submissions` 是服务端渲染，内嵌 `itemList`；参数：`page`、`problem_id`、`submitter`、`status`、`language`、`min_score`、`max_score`
+- 复盘表是按**比赛**记的，存在项目根目录 `reviews.md`（Markdown 表格，可直接改、也可提交到 git）：
+  `日期 | 比赛 | 排名 | 总分 | 各题 | 结论 | 复盘`；排名/总分/各题得分从
+  `/contest/<id>` 与 `/contest/<id>/ranklist` 自动抓（榜单里按 `/user/<uid>` 定位自己），
+  同一场比赛再次 `add` 会覆盖那一行而不是追加
+- 提交详情是从 `/submission/<id>` 页面内嵌的 `roughData` 与 `unformattedCode` 里解析的，
+  已完成提交没有逐测试点明细（站点只在评测过程中通过 socket 推送），所以这里给的是概要 + 代码
+- `run` 现在每组样例会写出 `<名>.out`（用户输出）和 `<名>.err`（标准错误）；如果期望输出本身就是 `<名>.out`，
+  用户输出改写成 `<名>.user.out`，不会覆盖判题数据
 
 ## 配置
 
