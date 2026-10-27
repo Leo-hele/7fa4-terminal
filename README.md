@@ -15,15 +15,16 @@
 | `list [章节]` | 题目列表，支持 `list 6.5.5` 这种章节号 |
 | `pull <题>` | 拉题面 + 图片 + 样例（自动解压 zip），生成 C++ 文件 |
 | `statement <题>` | 只看题面 |
-| `submit <题>` | 提交代码；外站题直连 vjudge，AC 后才同步到 7FA4（`--via 7fa4` 走代理） |
+| `submit <题>` | 提交代码并自动跟进评测结果；外站题直连 vjudge，AC 后才同步到 7FA4（`--via 7fa4` 走代理），`--no-watch` 不跟进 |
 | `push <题>` | 把 vjudge 上已 AC 的记录同步到 7FA4，不重复提交 |
 | `vjlogin` / `vjcheck` | 用账号密码登录 vjudge / 检查会话是否有效 |
 | `task` / `tasks` | 查看 vjudge 任务 |
-| `run <题>` | 本地编译（Windows / Linux 通用）并在样例上跑，用户输出/错误写到 `<名>.out` / `<名>.err` |
+| `run <题>` | 本地编译（Windows / Linux 通用）并在样例上跑，用户输出/错误写到 `<名>.out` / `<名>.err`；目录里有多份 cpp 时默认跑 `pull` 生成的那份（`-f` 指定其它） |
+| `stress <题>` | 对拍：随机数据跑「正解 vs 暴力」，不一致就保存用例（`1.in`/`sol.out`/`brute.out`） |
 | `submission <编号>` | 看提交状态、分数、时间/内存，`--code` 显示代码、`--save` 存代码（也接受 `/submissions?id=123`） |
 | `submissions` | 提交记录查询：`--page/--pages` 分页，`--problem/--submitter/--status/--language/--min-score/--max-score` 筛选 |
 | `plan [show\\|add] [日期]` | 计划按天读写：`plan show 明天`、`plan add 后天 -m "..." -p "71354"`；`plan home` 看首页概览 |
-| `review` | **比赛复盘表**：`add <比赛>` 自动带排名/总分/各题得分，`list` 查看、`show <关键字>` 过滤 |
+| `review` | **站点复盘（tag）**：`show` 查看、`timeline -i N` 改时间线、`set -q 题目` 改某题，写完直接上传 |
 | `help [命令]` | 分级帮助：`help` 总览，`help sftp` 看该命令参数 |
 | `paper` | 纸面题答案图片：`get` 备份 / `submit` 上传 / `restore` 还原 |
 | `export <题>` | 题面 markdown 导出 PNG（本地图片一起嵌入） |
@@ -92,6 +93,7 @@ python 7fa4_terminal.py --help
 7fa4 list 6.5.5                     # 看某章节题目
 7fa4 pull Q6.4.6.1                  # 拉题面、样例，生成 6.4.6.1.cpp
 7fa4 run Q6.4.6.1                   # 本地跑样例
+7fa4 stress Q6.4.6.1 -g gen.cpp -b brute.cpp   # 对拍：随机数据 vs 暴力
 7fa4 submit Q6.4.6.1 -l cpp17       # 提交
 7fa4 export Q6.4.6.1                # 题面导出 PNG
 7fa4 sftp login                     # SFTP 存取（5307），详见下文
@@ -154,10 +156,29 @@ python 7fa4_terminal.py --help
 
 `cd` 会先校验目标存在且是目录；`ls` 输出目录优先，带大小和修改时间。
 
+## 对拍
+
+```bash
+7fa4 stress Q6.4.6.1                          # 自动找：pull 那份当正解，brute/baoli/bf、gen/maker/rand
+7fa4 stress Q6.4.6.1 -s ac.cpp -b brute.cpp -g gen.cpp -n 500
+7fa4 stress problems/77425_luoguP4597 --dir D:\tmp\stress   # 直接给目录
+```
+
+规则：
+
+- 正解默认是 `pull` 生成的那份（`meta.json` 的 `cpp`），`-s` 可换
+- 暴力按文件名猜（`brute/baoli/bf/暴力/naive`），生成器按 `gen/maker/rand/data` 猜，都会跳过正解本身
+- 生成器标准写法：**读 `argv[1]` 当随机种子**，数据打到 stdout
+- 每轮顺序：`gen(seed) → sol → brute`，用 `run_cpp` 编译产物放临时目录，跑完删除
+- 不一致（或正解 TLE/RE）时把用例存到 `<题目目录>/stress/fail<轮次>/`：`1.in`、`sol.out`、`brute.out`、`note.txt`，
+  并打印第一处不同的行号和两边内容，可直接 `7fa4 run <题> -f ...` 复现
+- 暴力 TLE 会跳过该轮（认为是数据超出暴力范围），不误判
+
 ## 计划 / 复盘 / 提交详情
 
 ```bash
-7fa4 plan                            # 今天的计划（描述 + 计划题目 + 教师计划 + 完成情况）
+7fa4 plan                            # 今天的计划（描述 + 题目：id/题号/题目名 + 教师计划 + 完成情况）
+7fa4 plan show 昨天 --no-titles        # 不查题目名（省几次请求）
 7fa4 plan show 明天                   # 看明天的（也支持 后天 / yesterday / 2026-10-28 / +3）
 7fa4 plan add 明天 -m "树剖复习" -p "71354 Q3.3.6.4"   # 写明天的计划
 7fa4 plan add 后天 -m "线段树合并" -r "已完成 2/3" -t "剩余题明天补"
@@ -170,11 +191,20 @@ python 7fa4_terminal.py --help
 7fa4 submissions --submitter 2025005011 --status Accepted   # 按人 + 状态
 7fa4 submissions --language cpp17 --min-score 90            # 按语言 + 分数
 
-7fa4 review add 23909 -v 正常 -m "B 题只拿 30，C 题 15，D 没做"
-7fa4 review add 乙模复四-2026-23 -v 崩了 -m "A 题读错题意"   # 名称关键字也行
-7fa4 review show 2026-23             # 按比赛名/日期过滤
-7fa4 review list                     # 表格形式查看（--limit N 控制条数）
-7fa4 review show 2026-23              # 按比赛名/日期过滤
+7fa4 review export 3152624            # 下载复盘成 md（默认 reviews/<tag>.md）
+7fa4 review new 3152624               # 生成空模板，从零开始写
+#   ... 用编辑器改 md ...
+7fa4 review import 3152624 -f reviews/3152624.md     # 上传（改完直接提交）
+7fa4 review import 3152624 -f reviews/3152624.md -n  # 只看解析结果不上传
+
+7fa4 review show 3152624              # 看这场复盘（时间线 + 每题：常规检查/子任务/反思/估分）
+7fa4 review show "https://jx.7fa4.cn:8888/review/user_tag/edit?user_id=2194&tag_id=3152624"
+7fa4 review html 3152624              # 走 /review/user_tags/html 的原始视图
+
+7fa4 review timeline 3152624 -i 3 -p "B 题正解" -a "写完发现假了，放弃"   # 改第 3 行时间线
+7fa4 review set 3152624 -q 82376 --rethink "数据：样例。探索：整体二分。反思：输出多了。" \
+    --guess 30 --normal "time=done,test=skip"                          # 改某道题的复盘
+7fa4 review timeline 3152624 -i 1 -p "..." -n                          # 预演（不提交）
 
 7fa4 submission 1048450              # 状态、分数、用时、内存、语言、提交者、提交时间
 7fa4 submission /submissions?id=1048450   # 也接受这种写法
@@ -190,14 +220,28 @@ python 7fa4_terminal.py --help
    `TypeError: ... reading 'is_owner'`，这时会打印该错误并说明取不到代码；
    若第一次失败，会再问一次「换个方式再试一次（重新请求）？」，同样可以停下来。
 
+- `plan show` 里的题目名通过 `GET /api/v2/search/problems/<id>` 拿（返回 `Q3.3.6.4. 超级钢琴`），结果缓存在
+  `config.json` 的 `problem_titles`；`--no-titles` 可跳过这些请求
 - 计划接口：读 `GET /user_plan?format=json&user_id=<uid>&date=<ts>&type=day`，写 `POST /user_plan`
   （`{id, type, date, user_id, problem_ids, plan, result, tweak}`，`id` 为已有记录的编号）；`problem_ids` 用 `|` 分隔，
   命令行里用空格/逗号写会自动转换；用户 id 首次从首页 `/user_plans/<uid>` 取到后缓存进配置
 - 提交记录页 `/submissions` 是服务端渲染，内嵌 `itemList`；参数：`page`、`problem_id`、`submitter`、`status`、`language`、`min_score`、`max_score`
-- 复盘表是按**比赛**记的，存在项目根目录 `reviews.md`（Markdown 表格，可直接改、也可提交到 git）：
-  `日期 | 比赛 | 排名 | 总分 | 各题 | 结论 | 复盘`；排名/总分/各题得分从
-  `/contest/<id>` 与 `/contest/<id>/ranklist` 自动抓（榜单里按 `/user/<uid>` 定位自己），
-  同一场比赛再次 `add` 会覆盖那一行而不是追加
+- 复盘可以用 markdown 写：`review export` 导出 → 编辑 → `review import` 上传；格式是
+  `## 时间线`（`### 14:30` + `计划：`/`完成：`）和 `## 题目`（`### S15.26.24.1 乾坤横移` +
+  `估分：`/`常规：k=v, …`/`子任务：- 得分/总分 期望N 描述`/`反思：`/`其他：`/`错误：`）。
+  多行内容用 `~~~` 围栏，避免正文里的「反思：」被当成字段；`review new` 只保留结构、内容清空，适合从零写
+- 复盘直接读写**站点**的复盘 tag（不是本地文件）：
+  - 读：`GET /review/user_tag/edit?format=json&user_id=<uid>&tag_id=<tid>` →
+    `{tag_review:[{time,plan,achieve}], problems:[{id,title,exercise_name,review:{normal,subtasks,rethink,other,guess_score,...}}]}`
+  - 写：`POST /review/user_tag/edit`，表单字段 `data` = 上面结构的 JSON（`problem_review` 以题目 id 为键）
+  - `tag_id` 从编辑页 URL 里取（`?tag_id=...`），命令支持直接粘整条 URL
+  - **时间线行数固定**：只能改已有行（`review timeline -i N`），服务端按行校验，新增行会报「第 N 行参数未完整填写」，
+    所以 `review add` 只给提示不提交
+  - 子任务的 `actual/expected/total/description` 要按字符串传（前端读的是输入框），数字 `0` 会被判成「没填写」；
+    另外整表回传时不能把「通过检查」的项改成不通过，否则服务端拒绝保存
+- 提交后跟进：先记下 `/submissions?submitter=<学号>` 里当前最新编号，提交成功后轮询这个列表找到更大的编号，
+  再盯 `/submissions/?id=<编号>` 直到 `result` 出现且不在 `Judging/Compiling/Running/Waiting/Pending` 里；
+  `--wait` 控制最长等待（默认 180s），`--no-watch` 关掉跟进，学号首次从 `/user/<uid>` 页面标题取到后缓存进配置
 - 提交详情是从 `/submission/<id>` 页面内嵌的 `roughData` 与 `unformattedCode` 里解析的，
   已完成提交没有逐测试点明细（站点只在评测过程中通过 socket 推送），所以这里给的是概要 + 代码
 - `run` 现在每组样例会写出 `<名>.out`（用户输出）和 `<名>.err`（标准错误）；如果期望输出本身就是 `<名>.out`，
@@ -224,6 +268,8 @@ python 7fa4_terminal.py --help
 | `sessions` | 各站点登录态（自动维护） |
 | `sftp_host` / `sftp_port` / `sftp_user` / `sftp_password` / `sftp_key` | SFTP 连接信息 |
 | `sftp_cwd` / `sftp_local` | SFTP 远程当前目录 / 本地暂存目录 |
+| `submitter` | 自己的学号（提交后跟进状态用，首次从 `/user/<uid>` 取到后缓存） |
+| `user_id` | 站内用户 id（计划、复盘用，首次从首页 `/user_plans/<uid>` 取到后缓存） |
 | `update_url` | 自动更新源，默认 `http://localhost:9080/terminal.py` |
 | `auto_update` | `off` / `check`（默认，只提示）/ `apply`（自动替换） |
 | `update_interval` | 自动检查间隔秒数，默认 `21600`（6 小时） |

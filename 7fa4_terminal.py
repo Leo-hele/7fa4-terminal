@@ -9,18 +9,18 @@
     list      题目列表（支持章节号：list 1.2.1 / list 6.5.5）
     pull      获取题目：题面 + 图片（下载到 images/）+ 样例（自动解压 zip）+ 生成 C++ 文件
     statement 只看题面
-    submit    提交代码（外站题直连 vjudge，AC 才把记录同步到 7FA4；
+    submit    提交代码并跟进评测状态（--no-watch 关闭；外站题直连 vjudge，AC 才同步到 7FA4；
               --via 7fa4 时会把验证码图片在终端画出来并保存/打开）
     push      把 vjudge 上已 AC 的记录同步到 7FA4（不重复提交）
     vjlogin   用 vjudge 账号密码登录并保存会话（替代手抠 JSESSIONID）
     vjcheck   检查 vj_cookie 是否还有效
     task      继续查看某个 vjudge 任务（--via 7fa4 代理提交时会给任务号）
     tasks     列出 7FA4 上的 vjudge 任务
-    run       编译并在样例上运行（用户输出/错误写到 <名>.out / <名>.err）
+    run       编译并在样例上运行（多份 cpp 时跑 pull 那份；输出/错误写到 <名>.out/.err）
     submission 查看提交：状态用 /submissions/?id=123，代码用 /submission/123（会问是否继续）
     submissions 提交记录查询：分页 + 题目/提交者/状态/语言/分数筛选
     plan      计划按天读写：plan show 明天 / plan add 后天 -m "..." -p "71354"
-    review    比赛复盘表：add 记一场（自动带排名/总分/各题），list 查看，show 过滤
+    review    站点复盘(tag)：show 查看 / timeline -i N 改时间线 / set -q 题目 改某题
     help      分级帮助：help 总览，help <命令> 看参数
     paper     纸面题答案图片：get 备份 / submit 上传 / restore 还原
     export    把题面 markdown 导出成 PNG（本地图片会一起嵌入）
@@ -1200,6 +1200,79 @@ def cmd_pull(args):
     return 0
 
 
+def current_submitter(client):
+    """当前用户的学号（/submissions 的 submitter 参数），取到后写进 config 缓存。"""
+    cfg = load_config()
+    if cfg.get("submitter"):
+        return str(cfg["submitter"])
+    uid = current_user_id(client)
+    html = client.get(f"/user/{uid}").text
+    m = re.search(r"<title>\s*(\d+)\s*-\s*用户", html) or re.search(r"\b(20\d{8})\b", html)
+    if not m:
+        raise RuntimeError("没能取到学号，可 config set submitter=你的学号")
+    cfg["submitter"] = m.group(1)
+    try:
+        save_config(cfg)
+    except OSError:
+        pass
+    return m.group(1)
+
+
+def fetch_submission_items(client, page=1, **params):
+    r = client.get("/submissions", params=dict(params, page=page))
+    return extract_json_array(r.text, "itemList") or []
+
+
+def latest_submission_id(client, submitter):
+    items = fetch_submission_items(client, submitter=submitter)
+    ids = [int((it.get("info") or {}).get("submissionId") or 0) for it in items]
+    return max(ids) if ids else 0
+
+
+RUNNING_WORDS = {"judging", "compiling", "running", "waiting", "pending", "queued", "rejudging"}
+
+
+def follow_submission(client, submitter, baseline, wait=180.0, interval=1.5):
+    """提交后跟进：先找到比 baseline 新的提交编号，再轮询它的评测状态。"""
+    start = time.time()
+    sid = None
+    last = None
+    while time.time() - start < wait:
+        if sid is None:
+            fresh = []
+            for item in fetch_submission_items(client, submitter=submitter):
+                info = item.get("info") or {}
+                try:
+                    sid_value = int(info.get("submissionId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if sid_value > baseline:
+                    fresh.append(sid_value)
+            if fresh:
+                sid = max(fresh)
+                print(f"[跟进] 新提交 #{sid}  {client.base}/submission/{sid}")
+            else:
+                time.sleep(interval)
+                continue
+
+        item = fetch_submission_item(client, sid)
+        result = (item or {}).get("result") or {}
+        running = bool((item or {}).get("running"))
+        status = (result.get("result") or "").strip() or ("评测中" if running else "等待评测")
+        if status != last:
+            print(f"[状态] {status}")
+            last = status
+        if status.lower() not in RUNNING_WORDS and not running:
+            print(f"[评测] {status}  分数 {result.get('score')}  "
+                  f"用时 {result.get('time')} ms  内存 {result.get('memory')} KB")
+            return status
+        time.sleep(interval)
+
+    print(f"[跟进] 等了 {wait:g}s 还没出结果，稍后用 submission {sid} 查看" if sid
+          else f"[跟进] 等了 {wait:g}s 没找到新提交，稍后用 submissions 查看")
+    return None
+
+
 def cmd_submit(args):
     client = make_client(args)
     client.load_session()
@@ -1212,11 +1285,7 @@ def cmd_submit(args):
 
     source = args.file
     if not source:
-        folder = find_problem_dir(pid)
-        if folder:
-            cpps = [f for f in sorted(os.listdir(folder)) if f.endswith((".cpp", ".cc", ".cxx"))]
-            if cpps:
-                source = os.path.join(folder, cpps[0])
+        source = pick_source_file(find_problem_dir(pid))
     if not source:
         print("[错误] 未指定代码文件，且本地未找到该题目录，请用 -f 指定")
         return 1
@@ -1228,6 +1297,17 @@ def cmd_submit(args):
     if not code.strip():
         print(f"[错误] 代码为空：{source}")
         return 1
+
+    # 提交后跟进：先记住“最新的提交编号”，提交完再找更新的那条
+    follow = not getattr(args, "no_watch", False)
+    submitter, baseline = None, 0
+    if follow:
+        try:
+            submitter = current_submitter(client)
+            baseline = latest_submission_id(client, submitter)
+        except RuntimeError as exc:
+            print(f"[跟进] 跳过（{exc}）")
+            follow = False
 
     try:
         meta = client.problem_meta(pid)
@@ -1257,6 +1337,8 @@ def cmd_submit(args):
         m = re.search(r"/submission/(\d+)", location)
         if m:
             print(f"[评测] {client.base}/submission/{m.group(1)}")
+        elif follow:
+            follow_submission(client, submitter, baseline, wait=getattr(args, "wait", 180.0))
         return 0
     if "json" in ctype:
         try:
@@ -1266,6 +1348,8 @@ def cmd_submit(args):
         code_ = data.get("error_code")
         if code_ in (None, 1, "1"):
             print(f"[结果] 提交成功 {data if data else ''}")
+            if follow:
+                follow_submission(client, submitter, baseline, wait=getattr(args, "wait", 180.0))
             return 0
         print(f"[结果] 提交失败：{ERRORS.get(code_, f'error_code={code_}')} {data}")
         return 1
@@ -1898,11 +1982,7 @@ def cmd_push(args):
 
     source = args.file
     if not source:
-        folder = find_problem_dir(pid)
-        if folder:
-            cpps = [f for f in sorted(os.listdir(folder)) if f.lower().endswith((".cpp", ".cc", ".cxx"))]
-            if cpps:
-                source = os.path.join(folder, cpps[0])
+        source = pick_source_file(find_problem_dir(pid))
     if not source or not os.path.exists(source):
         print("[错误] 找不到代码文件，用 -f 指定")
         return 1
@@ -2055,6 +2135,42 @@ def cmd_config(args):
     return 0
 
 
+def pick_source_file(folder):
+    """挑题目目录里的代码文件：优先 pull 时生成的那个（meta.json 的 cpp），否则取最早创建的。
+
+    同一题目录里常常有好几份代码（正解、暴力、对拍），默认应该跑当初 pull 生成的那份。
+    """
+    if not folder or not os.path.isdir(folder):
+        return None
+
+    meta_path = os.path.join(folder, "meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                rel = (json.load(f).get("cpp") or "").strip()
+        except (OSError, ValueError):
+            rel = ""
+        if rel:
+            for cand in (os.path.join(BASE_DIR, rel), os.path.join(folder, os.path.basename(rel))):
+                if os.path.exists(cand) and cand.lower().endswith((".cpp", ".cc", ".cxx")):
+                    return cand
+
+    files = [os.path.join(folder, name) for name in os.listdir(folder)
+             if name.lower().endswith((".cpp", ".cc", ".cxx"))]
+    if not files:
+        return None
+
+    def born(path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return (float("inf"), float("inf"), os.path.basename(path))
+        # Windows 的 st_ctime 是创建时间；Linux 上它是 inode 变更时间，近似即可
+        return (st.st_ctime, st.st_mtime, os.path.basename(path))
+
+    return sorted(files, key=born)[0]
+
+
 def collect_samples(folder):
     """扫描 samples/，返回 [(显示名, 输入路径, 期望输出路径或 None)]，相同输入只保留一份。"""
     sample_dir = os.path.join(folder, "samples")
@@ -2076,7 +2192,7 @@ def collect_samples(folder):
         seen.add(digest)
         stem = name[:-3]
         expected = None
-        for ext in (".out", ".ans", ".exp", ".answer"):
+        for ext in (".ans", ".exp", ".answer", ".out"):
             cand = os.path.join(sample_dir, stem + ext)
             if os.path.exists(cand):
                 expected = cand
@@ -2125,9 +2241,9 @@ def cmd_run(args):
             print(f"[错误] 本地没有题目目录，先执行 pull {args.id}")
             return 1
         if not source:
-            cpps = [f for f in sorted(os.listdir(folder)) if f.lower().endswith((".cpp", ".cc", ".cxx"))]
-            if cpps:
-                source = os.path.join(folder, cpps[0])
+            source = pick_source_file(folder)
+            if source:
+                print(f"[代码] 自动选择 {os.path.basename(source)}（pull 时创建的那份，可用 -f 指定其它）")
     if not source or not os.path.exists(source):
         print(f"[错误] 找不到代码文件，请用 -f 指定：{source}")
         return 1
@@ -2228,6 +2344,182 @@ def cmd_run(args):
     print(f"[输出] 每组用户输出/错误写到样例同目录：<名>.out（无期望输出时）/ <名>.user.out / <名>.err")
     print(f"[结果] 通过 {passed}/{len(cases)}")
     return 0 if passed == len(cases) else 1
+
+
+STRESS_HINTS = {
+    "brute": ("brute", "baoli", "bf", "暴力", "wrong", "naive"),
+    "gen": ("gen", "maker", "make", "rand", "data"),
+}
+
+
+def find_stress_file(folder, explicit, kind, exclude=()):
+    """找对拍用的文件：显式指定优先，否则按关键字猜（brute/baoli/bf、gen/maker…）。"""
+    if explicit:
+        for path in (explicit, os.path.join(folder, explicit)):
+            if os.path.exists(path):
+                return os.path.abspath(path)
+        return None
+    files = [n for n in sorted(os.listdir(folder))
+             if n.lower().endswith((".cpp", ".cc", ".cxx")) and n not in exclude]
+    for hint in STRESS_HINTS[kind]:
+        for name in files:
+            if hint in name.lower():
+                return os.path.join(folder, name)
+    return None
+
+
+def run_cpp(exe, in_data, timeout, argv=None):
+    """跑一次程序，返回 (stdout, stderr, 耗时, 错误类型或 None)。"""
+    start = time.perf_counter()
+    try:
+        p = subprocess.run([exe] + list(argv or []), input=in_data,
+                           capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return b"", b"", time.perf_counter() - start, "TLE"
+    except OSError as exc:
+        return b"", str(exc).encode(), time.perf_counter() - start, "RE"
+    return p.stdout, p.stderr, time.perf_counter() - start, (None if p.returncode == 0 else f"RE {p.returncode}")
+
+
+def first_diff_line(text_a, text_b):
+    """返回第一处不同的行号与内容，用于快速定位。"""
+    a = normalize_output(text_a).split("\n")
+    b = normalize_output(text_b).split("\n")
+    for i in range(max(len(a), len(b))):
+        left = a[i] if i < len(a) else "<无>"
+        right = b[i] if i < len(b) else "<无>"
+        if left != right:
+            return i + 1, left, right
+    return 0, "", ""
+
+
+def cmd_stress(args):
+    """对拍：生成随机数据，跑正解与暴力，输出不一致就停下来保存用例。"""
+    client = make_client(args)
+    client.load_session()
+
+    folder = None
+    if args.id:
+        if os.path.isdir(args.id):
+            folder = os.path.abspath(args.id)
+        else:
+            pid = args.id
+            if not pid.isdigit():
+                try:
+                    pid, _ = resolve_problem(client, pid)
+                except RuntimeError as exc:
+                    print(f"[错误] {exc}")
+                    return 1
+            folder = find_problem_dir(pid)
+            if not folder:
+                print(f"[错误] 本地没有题目目录，先执行 pull {args.id}")
+                return 1
+    else:
+        print("[错误] 需要题目（或直接给目录）：stress Q6.4.6.1 -g gen.cpp -b brute.cpp")
+        return 1
+
+    solution = None
+    if args.solution:
+        for path in (args.solution, os.path.join(folder, args.solution)):
+            if os.path.exists(path):
+                solution = os.path.abspath(path)
+                break
+    else:
+        solution = pick_source_file(folder)
+    if not solution or not os.path.exists(solution):
+        print("[错误] 找不到正解代码，用 -s 指定（相对路径按题目目录解析）")
+        return 1
+    brute = find_stress_file(folder, args.brute, "brute", exclude=(os.path.basename(solution),))
+    if not brute:
+        print("[错误] 找不到暴力代码，用 -b 指定（文件名带 brute/baoli/bf 可自动识别）")
+        return 1
+    gen = find_stress_file(folder, args.gen, "gen")
+    if not gen:
+        print("[错误] 找不到数据生成器，用 -g 指定（文件名带 gen/maker/rand 可自动识别）")
+        print('      生成器写法：读 argv[1] 当随机种子，把数据输出到 stdout，例如')
+        print('        int main(int argc, char** argv) { srand(atoi(argv[1])); ... cout << n << "\\n"; }')
+        return 1
+
+    tmp_dir = tempfile.mkdtemp(prefix="7fa4_stress_")
+    exes = {}
+    for key, source in (("sol", solution), ("brute", brute), ("gen", gen)):
+        exe = os.path.join(tmp_dir, key + EXE_SUFFIX)
+        ok, log = compile_cpp(source, exe, args.std)
+        if not ok:
+            print(f"[编译失败] {os.path.basename(source)}")
+            print(log.strip()[:2000] or "(无输出)")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return 1
+        if os.name != "nt":
+            try:
+                os.chmod(exe, 0o755)
+            except OSError:
+                pass
+        exes[key] = exe
+
+    print(f"[对拍] 正解={os.path.basename(solution)}  暴力={os.path.basename(brute)}  "
+          f"生成器={os.path.basename(gen)}")
+    print(f"[对拍] {args.times} 轮，单次限时 {args.tl:g}s")
+
+    fail_dir = args.dir or os.path.join(folder, "stress")
+    started = time.time()
+    max_sol = 0.0
+
+    for i in range(1, args.times + 1):
+        # 生成器把轮次当随机种子传进 argv[1]，读 stdin 也照常可用
+        out, err, _, etype = run_cpp(exes["gen"], b"", args.tl, argv=[str(i)])
+        if etype:
+            print(f"[错误] 生成器第 {i} 轮失败：{etype}")
+            print(normalize_output(err.decode("utf-8", "replace"))[:500])
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return 1
+
+        got, gerr, elapsed, etype = run_cpp(exes["sol"], out, args.tl)
+        max_sol = max(max_sol, elapsed)
+        if etype:
+            print(f"  [{i}] 正解 {etype}（{elapsed:.3f}s），保存用例")
+            _save_stress_case(fail_dir, i, out, got, b"", f"正解 {etype}")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return 1
+
+        want, _, _, betype = run_cpp(exes["brute"], out, args.tl)
+        if betype:
+            print(f"  [{i}] 暴力 {betype}，跳过（可能是暴力太慢或数据超范围）")
+            continue
+
+        if normalize_output(got.decode("utf-8", "replace")) != normalize_output(want.decode("utf-8", "replace")):
+            line_no, left, right = first_diff_line(want.decode("utf-8", "replace"),
+                                                   got.decode("utf-8", "replace"))
+            print(f"  [{i}] 发现差异（第 {line_no} 行）")
+            print(f"      暴力: {left[:200]}")
+            print(f"      正解: {right[:200]}")
+            path = _save_stress_case(fail_dir, i, out, got, want, f"第 {line_no} 行不同")
+            print(f"[保存] 用例 -> {path}")
+            print("[失败] 正解与暴力输出不一致，可先用 run 复现")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return 1
+
+        if i % 50 == 0 or i == args.times:
+            print(f"  [{i}/{args.times}] 一致  正解耗时最大 {max_sol:.3f}s")
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"[通过] {args.times} 轮全部一致，用时 {time.time() - started:.1f}s")
+    return 0
+
+
+def _save_stress_case(fail_dir, index, in_data, sol_out, brute_out, note):
+    """把出错的那组数据落盘：1.in / sol.out / brute.out / note.txt"""
+    case_dir = os.path.join(fail_dir, f"fail{index}")
+    os.makedirs(case_dir, exist_ok=True)
+    with open(os.path.join(case_dir, "1.in"), "wb") as f:
+        f.write(in_data)
+    with open(os.path.join(case_dir, "sol.out"), "wb") as f:
+        f.write(sol_out)
+    if brute_out:
+        with open(os.path.join(case_dir, "brute.out"), "wb") as f:
+            f.write(brute_out)
+    write_text(os.path.join(case_dir, "note.txt"), note + "\n")
+    return case_dir
 
 
 def guess_image_type(path):
@@ -2455,6 +2747,49 @@ def fetch_user_plan(client, user_id, day, ptype="day"):
     return (data.get("user_plan") or {}), ts
 
 
+def problem_titles(client, pids):
+    """批量取题目名：抓题目页 <title>（比 problem_meta 轻），结果缓存进 config。"""
+    cfg = load_config()
+    cache = cfg.get("problem_titles")
+    cache = cache if isinstance(cache, dict) else {}
+    out, changed = {}, False
+    for pid in pids:
+        pid = str(pid)
+        cached = cache.get(pid) or ""
+        if re.match(r"^[A-Za-z]*\d[\d.]*\.?\s", cached):    # 带题号的才认
+            out[pid] = cached
+            continue
+
+        name = ""
+        try:
+            data = client.get(f"/api/v2/search/problems/{pid}").json()
+            for item in data.get("results") or []:
+                if str(item.get("value")) == pid:
+                    name = (item.get("name") or "").strip()
+                    break
+        except (RuntimeError, ValueError):
+            name = ""
+        if not name:
+            try:
+                html = client.get(f"/problem/{pid}").text
+            except RuntimeError:
+                continue
+            m = re.search(r"<title>(.*?)</title>", html, re.S)
+            if m:
+                name = re.sub(r"\s*-\s*题目\s*-\s*7FA4\s*$", "", m.group(1).strip())
+        if name and "错误" not in name:
+            out[pid] = name
+            cache[pid] = name
+            changed = True
+    if changed:
+        cfg["problem_titles"] = cache
+        try:
+            save_config(cfg)
+        except OSError:
+            pass
+    return out
+
+
 def cmd_plan(args):
     """计划：home 看首页概览，show 看某天计划（默认今天），add 新建/修改某天计划。"""
     client = make_client(args)
@@ -2506,8 +2841,18 @@ def cmd_plan(args):
         pids = [p for p in pids if p]
         if pids:
             print(f"[题目] {len(pids)} 道")
+            titles = {} if args.no_titles else problem_titles(client, pids)
+            rows = []
             for pid in pids:
-                print(f"  {pid}")
+                name = titles.get(pid) or ""
+                no, title = split_problem_name(name) if name else ("", "")
+                rows.append((pid, no, title or name))
+            width = max((len(no) for _, no, _ in rows), default=0)
+            for pid, no, title in rows:
+                if no:
+                    print(f"  {pad(pid, 8)} {pad(no, width)}  {title}".rstrip())
+                else:
+                    print(f"  {pad(pid, 8)} {title}".rstrip())
         else:
             print("[题目] （无）")
         for key, label in (("teacher_plan", "教师"), ("result", "完成"), ("tweak", "调整")):
@@ -2632,198 +2977,421 @@ def cmd_submissions(args):
     return 0
 
 
-REVIEW_FILE = os.path.join(BASE_DIR, "reviews.md")
-REVIEW_HEADER = ("| 日期 | 比赛 | 排名 | 总分 | 各题 | 结论 | 复盘 |\n"
-                 "| --- | --- | --- | --- | --- | --- | --- |\n")
-REVIEW_COLS = 7
+# ---------------------------------------------------------------- 复盘（站点 tag）
+REVIEW_EDIT_URL = "/review/user_tag/edit"
 
 
-def read_review_rows():
-    if not os.path.exists(REVIEW_FILE):
-        return []
-    rows = []
-    with open(REVIEW_FILE, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line.startswith("|") or line.startswith("| ---") or "日期" in line:
-                continue
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if len(cells) >= REVIEW_COLS:
-                rows.append(cells[:REVIEW_COLS])
-    return rows
+def parse_tag_arg(text):
+    """从 tag_id 或整条编辑页 URL 里取 (tag_id, user_id)。"""
+    text = (text or "").strip()
+    tid = re.search(r"tag_id=(\d+)", text)
+    uid = re.search(r"user_id=(\d+)", text)
+    if tid:
+        return tid.group(1), (uid.group(1) if uid else None)
+    if text.isdigit():
+        return text, (uid.group(1) if uid else None)
+    raise RuntimeError(f"看不懂的复盘参数：{text}（给 tag_id，或直接粘编辑页 URL）")
 
 
-def write_review_rows(rows):
-    body = "".join("| " + " | ".join(c.replace("|", "\\|") for c in row) + " |\n" for row in rows)
-    write_text(REVIEW_FILE, "# 复盘表\n\n" + REVIEW_HEADER + body)
+def fetch_review_tag(client, tag_id, user_id):
+    """GET /review/user_tag/edit?format=json -> {tag_review, problems, ...}"""
+    r = client.get(REVIEW_EDIT_URL, params={"format": "json", "user_id": user_id, "tag_id": tag_id})
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"复盘接口返回异常（HTTP {r.status_code}）：{r.text[:120]}")
+    if not data.get("success"):
+        raise RuntimeError(f"读取复盘失败：{data.get('err') or data}")
+    return data
 
 
-def parse_contest_rows(html):
-    """模测列表：id / 名称 / 状态 / 开始时间 / 时长。"""
-    rows = []
-    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
-        m = re.search(r'href="/contest/(\d+)"[^>]*>([\s\S]*?)</a>', tr)
-        if not m:
+def review_payload(data):
+    """GET 的结构 -> POST 需要的结构（原样保留已写内容）。"""
+    def as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+    keys = ("normal", "subtasks", "rethink", "other", "guess_score", "mistakes")
+    problem_review = {}
+    for prob in data.get("problems") or []:
+        review = prob.get("review") or {}
+        item = {k: review[k] for k in keys if k in review}
+        # 子任务四项前端读的是输入框 .val()（字符串），数字 0 会被站点当成“没填”
+        subs = []
+        for sub in item.get("subtasks") or []:
+            subs.append({k: ("" if sub.get(k) is None else str(sub.get(k)))
+                         for k in ("actual", "expected", "total", "description")})
+        if "subtasks" in item:
+            item["subtasks"] = subs
+        problem_review[str(prob.get("id"))] = item
+    return {
+        "user_id": as_int(data.get("user_id")),
+        "tag_id": as_int(data.get("tag_id")),
+        "tag_review": data.get("tag_review") or [],
+        "problem_review": problem_review,
+    }
+
+
+def upload_review(client, payload):
+    """POST /review/user_tag/edit，表单字段 data = JSON 字符串（站点就是这么传的）。"""
+    r = client.request("post", REVIEW_EDIT_URL,
+                       data={"data": json.dumps(payload, ensure_ascii=False)})
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"上传失败（HTTP {r.status_code}）：{r.text[:160]}")
+    if not data.get("success"):
+        raise RuntimeError(f"上传失败：{data.get('err') or data}")
+    return data
+
+
+def print_review(problems, tag_review, title=""):
+    if title:
+        print(f"[复盘] {title}")
+    if tag_review:
+        print("[时间线]")
+        for line in tag_review:
+            print(f"  {line.get('time') or '--:--'}  {line.get('plan') or ''}")
+            for extra in (line.get("achieve") or "").splitlines():
+                if extra.strip():
+                    print(f"           {extra.strip()}")
+    if problems:
+        print(f"\n[题目] {len(problems)} 道")
+    for prob in problems:
+        rev = prob.get("review") or {}
+        print(f"  {prob.get('exercise_name')}. {prob.get('title')}   "
+              f"估分 {rev.get('guess_score')}  实际 {rev.get('sum_actual')}")
+        normal = rev.get("normal") or {}
+        if normal:
+            print("    常规：" + "  ".join(f"{k}={v}" for k, v in normal.items()))
+        for sub in rev.get("subtasks") or []:
+            print(f"    子任务：得 {sub.get('actual')}/{sub.get('total')}"
+                  f"（估 {sub.get('expected')}） {sub.get('description') or ''}")
+        for key, label in (("rethink", "反思"), ("other", "其他")):
+            val = (rev.get(key) or "").strip()
+            if val:
+                print(f"    {label}：" + val.replace("\n", " / "))
+        if rev.get("mistakes"):
+            print("    错误：" + " ".join(rev["mistakes"]))
+
+
+REVIEW_DIR = os.path.join(BASE_DIR, "reviews")
+
+
+def review_md_path(tag_id):
+    return os.path.join(REVIEW_DIR, f"{tag_id}.md")
+
+
+def review_to_markdown(data, title="", blank=False):
+    """把站点复盘转成可编辑的 markdown；blank=True 只留空结构（从零开始写）。"""
+    problems = data.get("problems") or []
+    tag_review = data.get("tag_review") or []
+    lines = [f"# 复盘 {title}".rstrip(), "",
+             "<!-- 改完执行: 7fa4 review import <tag> -f 本文件 -->",
+             "<!-- 时间线行数固定（站点按行校验），题目块数量也要对应，别删条目 -->", ""]
+
+    def block(text):
+        """多行内容用 ~~~ 围栏包住，避免内容里出现「反思：」之类被误认成字段。"""
+        body = "" if blank else (text or "").strip("\n")
+        return ["~~~", body, "~~~"]
+
+    lines += ["## 时间线", ""]
+    for entry in tag_review:
+        lines += [f"### {entry.get('time') or '00:00'}", ""]
+        lines += ["计划：", *block(entry.get("plan")), ""]
+        lines += ["完成：", *block(entry.get("achieve")), ""]
+
+    lines += ["## 题目", ""]
+    for prob in problems:
+        review = prob.get("review") or {}
+        head = f"{prob.get('exercise_name') or ''} {prob.get('title') or ''}".strip()
+        lines += [f"### {head}", ""]
+        guess = "" if blank or review.get("guess_score") is None else review["guess_score"]
+        lines += [f"估分：{guess}", ""]
+        normal = {} if blank else (review.get("normal") or {})
+        lines += ["常规：" + ", ".join(f"{k}={v}" for k, v in normal.items()), ""]
+        lines += ["子任务："]
+        for sub in ([] if blank else (review.get("subtasks") or [])):
+            desc = (sub.get("description") or "").strip()
+            lines.append(f"- {sub.get('actual')}/{sub.get('total')} "
+                         f"期望{sub.get('expected')} {desc}".rstrip())
+        lines += ["", "反思：", *block(review.get("rethink")), ""]
+        lines += ["其他：", *block(review.get("other")), ""]
+        lines += ["错误：" + ("" if blank else " ".join(review.get("mistakes") or [])), ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def parse_review_markdown(md):
+    """解析 review_to_markdown 的格式，返回 {'timeline': [...], 'problems': [...]}。"""
+    timeline, problems = [], []
+    section = None
+    item = None
+    field = None
+    buf = []
+    subtasks = []
+
+    def flush_field():
+        nonlocal buf, field
+        if item is not None and field:
+            item[field] = "\n".join(buf).strip("\n").strip()
+        buf, field = [], None
+
+    def flush_item():
+        nonlocal item, subtasks
+        flush_field()
+        if item is not None:
+            if subtasks:
+                item["subtasks"] = subtasks
+            (timeline if section == "timeline" else problems).append(item)
+        item, subtasks = None, []
+
+    in_fence = False
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        if line.strip() == "~~~":
+            in_fence = not in_fence
             continue
-        cid = m.group(1)
-        name = re.sub(r"\s*(已结束|未开始|进行中|已开始)\s*$", "", strip_tags(m.group(2))).strip()
-        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
-        head = cells[0] if cells else ""
-        status = ("已结束" if "已结束" in head else "未开始" if "未开始" in head
-                  else "进行中" if "进行中" in head else "")
-        rows.append({"id": cid, "name": name, "status": status,
-                     "start": cells[1] if len(cells) > 1 else "",
-                     "duration": cells[2] if len(cells) > 2 else ""})
-    return rows
-
-
-def find_contest(client, token):
-    """按编号或名称找比赛，返回 (id, 名称, 状态, 开始时间)。"""
-    token = (token or "").strip()
-    rows = parse_contest_rows(client.get("/contests").text)
-    if token.isdigit():
-        for row in rows:
-            if row["id"] == token:
-                return row["id"], row["name"], row["status"], row["start"]
-        return token, "", "", ""
-    key = token.lower()
-    hit = [r for r in rows if key in r["name"].lower()]
-    if len(hit) == 1:
-        r = hit[0]
-        return r["id"], r["name"], r["status"], r["start"]
-    if not hit:
-        raise RuntimeError(f"没有匹配的比赛：{token}（可用 review list 看已记录的，或 list 看模测）")
-    listing = "\n".join(f"  {r['id']}  {r['name']}  {r['status']}  {r['start']}" for r in hit[:15])
-    raise RuntimeError(f"比赛 {token} 匹配到多个，请用编号：\n{listing}")
-
-
-def parse_contest_problems(html, cid):
-    """比赛页的题目：编号/字母+标题/我在这题的状态。"""
-    probs, seen = [], set()
-    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
-        m = re.search(r'href="/contest/%s/problem/(\d+)"[^>]*>([\s\S]*?)</a>' % cid, tr)
-        if not m:
+        if in_fence:
+            if item is not None and field:
+                buf.append(line)
             continue
-        no, label = m.group(1), strip_tags(m.group(2))
-        if no in seen:
+        if line.startswith("## "):
+            flush_item()
+            name = line[3:].strip()
+            section = "timeline" if "时间线" in name else "problems" if "题目" in name else None
             continue
-        seen.add(no)
-        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
-        state = ""
-        for cell in cells:
-            for word in RESULT_WORDS:
-                if cell.startswith(word):
-                    state = word
+        if line.startswith("# "):
+            flush_item()
+            section = None
+            continue
+        if line.startswith("### "):
+            flush_item()
+            head = line[4:].strip()
+            if section == "timeline":
+                item = {"time": head, "plan": "", "achieve": ""}
+            elif section == "problems":
+                item = {"head": head}
+            continue
+        if item is None or section is None:
+            continue
+
+        if section == "timeline":
+            matched = False
+            for key, label in (("plan", "计划："), ("achieve", "完成：")):
+                if line.startswith(label):
+                    flush_field()
+                    field = key
+                    rest = line[len(label):].strip()
+                    buf = [rest] if rest else []
+                    matched = True
                     break
-            if state:
+            if not matched and field:
+                buf.append(line)
+            continue
+
+        if line.startswith("估分："):
+            flush_field()
+            item["guess_score"] = line[3:].strip()
+        elif line.startswith("常规："):
+            flush_field()
+            pairs = {}
+            for chunk in line[3:].replace("，", ",").split(","):
+                if "=" in chunk:
+                    key, value = chunk.split("=", 1)
+                    pairs[key.strip()] = value.strip()
+            item["normal"] = pairs
+        elif line.startswith("子任务："):
+            flush_field()
+            field = None
+        elif line.startswith("- "):
+            m = re.match(r"^-\s*(\S+)/(\S+)\s*(?:期望\s*(\S+))?\s*(.*)$", line)
+            if m:
+                subtasks.append({"actual": m.group(1), "total": m.group(2),
+                                 "expected": m.group(3) or "0",
+                                 "description": m.group(4).strip()})
+        elif line.startswith("反思："):
+            flush_field()
+            field = "rethink"
+            rest = line[3:].strip()
+            buf = [rest] if rest else []
+        elif line.startswith("其他："):
+            flush_field()
+            field = "other"
+            rest = line[3:].strip()
+            buf = [rest] if rest else []
+        elif line.startswith("错误："):
+            flush_field()
+            item["mistakes"] = line[3:].replace("，", " ").split()
+        elif field:
+            buf.append(line)
+    flush_item()
+    return {"timeline": timeline, "problems": problems}
+
+
+def apply_review_markdown(payload, parsed, problems):
+    """把 markdown 内容写进上传用的 payload（站点行数固定，逐条对应）。"""
+    timeline = payload["tag_review"]
+    for i, entry in enumerate(parsed["timeline"]):
+        if i >= len(timeline):
+            print(f"[警告] md 里时间线多了 {len(parsed['timeline']) - len(timeline)} 条，已忽略（站点行数固定）")
+            break
+        for key in ("time", "plan", "achieve"):
+            if key in entry:
+                timeline[i][key] = entry[key]
+
+    for entry in parsed["problems"]:
+        head = entry.get("head") or ""
+        target = None
+        for prob in problems:
+            name = f"{prob.get('exercise_name') or ''} {prob.get('title') or ''}".strip()
+            if head == name or (prob.get("exercise_name") and prob["exercise_name"] in head) \
+                    or (prob.get("title") and prob["title"] in head):
+                target = prob
                 break
-        probs.append({"no": no, "label": label, "state": state})
-    probs.sort(key=lambda p: int(p["no"]) if p["no"].isdigit() else 0)
-    return probs
-
-
-def fetch_contest_summary(client, cid):
-    html = client.get(f"/contest/{cid}").text
-    title = ""
-    m = re.search(r"<h1[^>]*>([\s\S]*?)</h1>", html)
-    if m:
-        title = strip_tags(m.group(1))
-    if not title:
-        m = re.search(r"<title>(.*?)</title>", html, re.S)
-        if m:
-            title = strip_tags(m.group(1)).split("-")[0].strip()
-    return {"title": title, "problems": parse_contest_problems(html, cid)}
-
-
-def fetch_my_rank(client, cid, uid):
-    """排行榜里找自己：排名 / 每题得分与时间 / 总分。"""
-    html = client.get(f"/contest/{cid}/ranklist").text
-    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
-        if f"/user/{uid}" not in tr:
+        if not target:
+            print(f"[警告] md 里的题目「{head}」在站点上没找到，已跳过")
             continue
-        tds = re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)
-        if len(tds) < 4:
-            continue
-
-        def score_of(cell):
-            m = re.search(r'class="score[^"]*"[^>]*>\s*([\d.]+)', cell)
-            t = re.search(r'class="submit_time"[^>]*>\s*([\d:]+)', cell)
-            return (m.group(1) if m else "-"), (t.group(1) if t else "")
-
-        per = [score_of(td) for td in tds[3:-1]]
-        total, total_time = score_of(tds[-1])
-        return {"rank": strip_tags(tds[0]), "per": per,
-                "total": total, "total_time": total_time}
-    return None
+        review = payload["problem_review"].setdefault(str(target["id"]), {})
+        if "guess_score" in entry:
+            value = entry["guess_score"]
+            review["guess_score"] = value if value != "" else None
+        if entry.get("normal"):
+            review["normal"] = entry["normal"]
+        if "subtasks" in entry:
+            review["subtasks"] = entry["subtasks"]
+        for key in ("rethink", "other"):
+            if key in entry:
+                review[key] = entry[key]
+        if "mistakes" in entry:
+            review["mistakes"] = entry["mistakes"]
+    return payload
 
 
 def cmd_review(args):
-    """比赛复盘表：add 记一场（自动带成绩），list 看表，show 看某场。"""
-    action = (args.action or "list").lower()
+    """站点复盘（tag）：show / html / export 导出 md / new 空模板 / import 上传 md。"""
+    client = make_client(args)
+    client.load_session()
+    action = (args.action or "show").lower()
+    try:
+        tag_id, uid_in_url = parse_tag_arg(getattr(args, "tag", ""))
+        user_id = getattr(args, "user", None) or uid_in_url or current_user_id(client)
+        data = fetch_review_tag(client, tag_id, user_id)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
 
-    if action == "add":
-        client = make_client(args)
-        client.load_session()
-        try:
-            cid, name, status, start = find_contest(client, args.contest)
-            summary = fetch_contest_summary(client, cid)
-            uid = args.user or current_user_id(client)
-            mine = fetch_my_rank(client, cid, uid)
-        except RuntimeError as exc:
-            print(f"[错误] {exc}")
-            return 1
-
-        name = name or summary.get("title") or cid
-        day = (start or "")[:10] or datetime.date.today().isoformat()
-        probs = summary.get("problems") or []
-        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        parts = []
-        for i, prob in enumerate(probs):
-            letter = re.sub(r"[^A-Za-z]", "", prob["label"].split(".")[0]) or letters[i:i + 1]
-            score = mine["per"][i][0] if (mine and i < len(mine["per"])) else "-"
-            parts.append(f"{letter}{score}")
-        detail = " ".join(parts)
-        rank_raw = (mine or {}).get("rank") or ""
-        rank = re.sub(r"[^\d]", "", rank_raw) or "-"
-        total = (mine or {}).get("total") or "-"
-
-        print(f"[比赛] {name}  {status or ''}  {start}".rstrip())
-        print(f"[成绩] 排名 {rank}  总分 {total}  各题 {detail or '-'}")
-        if not mine:
-            print("[提示] 排行榜里没找到你的成绩（可能没参加）")
-
-        note = args.note
-        if note is None:
-            try:
-                note = input("这一场的复盘（失误/教训，可空）: ")
-            except (EOFError, KeyboardInterrupt):
-                note = ""
-        row = [day, name, rank, total, detail or "-", args.verdict or "已复盘",
-               note.strip().replace("\n", "；")]
-        rows = [r for r in read_review_rows() if r[1] != name] + [row]
-        write_review_rows(rows)
-        print(f"[OK] 已写入 {REVIEW_FILE}（共 {len(rows)} 条）")
-        return 0
-
-    rows = read_review_rows()
-    if not rows:
-        print(f"[复盘] 还没有记录，用 review add <比赛编号或名称> -m \"失误与教训\" 记一场")
-        return 0
+    problems = data.get("problems") or []
+    tag_review = data.get("tag_review") or []
+    prefix = ""
+    for prob in problems:
+        name = prob.get("exercise_name") or ""
+        if name:
+            prefix = name.rsplit(".", 1)[0]
+            break
+    title = prefix or f"tag {tag_id}"
 
     if action == "show":
-        key = (args.contest or "").lower()
-        rows = [r for r in rows if key in r[1].lower() or key in r[0]]
-        if not rows:
-            print(f"[复盘] 没有和 {args.contest} 相关的记录")
-            return 1
+        print_review(problems, tag_review, title)
+        print(f"[链接] {client.base}/review/user_tags/html?tag_id={tag_id}")
+        return 0
 
-    limit = args.limit or 20
-    shown = rows[-limit:]
-    print(f"[复盘] 共 {len(rows)} 条" + (f"，显示最近 {len(shown)} 条" if len(shown) < len(rows) else ""))
-    for day, name, rank, total, detail, verdict, note in shown:
-        print(f"  {day}  {pad(name, 20)} 第 {pad(rank, 4)} 总分 {pad(total, 5)} "
-              f"{pad(detail, 24)} {pad(verdict, 6)} {note}")
-    print(f"[文件] {REVIEW_FILE}")
+    if action == "html":
+        r = client.get("/review/user_tags/html", params={"tag_id": tag_id})
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", r.text)
+        print(strip_tags(text)[:4000])
+        print(f"[链接] {client.base}/review/user_tags/html?tag_id={tag_id}")
+        return 0
+
+    if action in ("export", "new"):
+        blank = action == "new"
+        md = review_to_markdown(data, title, blank=blank)
+        path = args.file or args.output or review_md_path(tag_id)
+        write_text(path, md)
+        print(f"[{'模板' if blank else '导出'}] {path}  {len(md)} 字符")
+        print(f"[提示] 改完执行 review import {tag_id} -f \"{path}\" 上传")
+        return 0
+
+    payload = review_payload(data)
+
+    if action == "import":
+        if not args.file:
+            print(f"[错误] 用 -f 指定 md（先 review export {tag_id} 或 review new {tag_id}）")
+            return 1
+        if not os.path.exists(args.file):
+            print(f"[错误] 文件不存在：{args.file}")
+            return 1
+        parsed = parse_review_markdown(read_text_any(args.file))
+        apply_review_markdown(payload, parsed, problems)
+        print(f"[导入] {os.path.basename(args.file)}：时间线 {len(parsed['timeline'])} 条，"
+              f"题目 {len(parsed['problems'])} 道")
+
+    if action == "add":
+        print("[提示] 站点不支持给复盘表增加时间线（行数固定，服务端按行校验）")
+        print("       改已有行用: review timeline <tag> -i <行号> -p \"计划\" -a \"完成\"")
+        print("       改某道题用: review set <tag> -q <题目> --rethink \"...\"")
+        return 1
+
+    if action == "timeline":
+        lines = payload["tag_review"]
+        idx = args.index or 0
+        if not (1 <= idx <= len(lines)):
+            print(f"[错误] 行号要在 1~{len(lines)} 之间（当前复盘共 {len(lines)} 行）")
+            for i, line in enumerate(lines, 1):
+                print(f"  {i}. {line.get('time') or '--:--'}  {line.get('plan') or ''}")
+            return 1
+        line = lines[idx - 1]
+        if args.time:
+            line["time"] = args.time
+        if args.plan is not None:
+            line["plan"] = args.plan
+        if args.achieve is not None:
+            line["achieve"] = args.achieve
+        print(f"[时间线] 第 {idx} 行 -> {line.get('time')}  {line.get('plan') or ''}")
+    elif action == "set":
+        key = (args.problem or "").lower()
+        hit = [p for p in problems
+               if key and (key in str(p.get("title", "")).lower()
+                           or key == str(p.get("exercise_name", "")).lower()
+                           or key == str(p.get("id")))]
+        if len(hit) != 1:
+            print(f"[错误] 题目匹配到 {len(hit)} 个，用题目名/编号/id 精确指定：")
+            for prob in problems:
+                print(f"  {prob.get('id')}  {prob.get('exercise_name')}  {prob.get('title')}")
+            return 1
+        rev = payload["problem_review"].setdefault(str(hit[0]["id"]), {})
+        if args.rethink is not None:
+            rev["rethink"] = args.rethink
+        if args.other is not None:
+            rev["other"] = args.other
+        if args.guess is not None:
+            rev["guess_score"] = args.guess
+        if args.normal:
+            for pair in args.normal.split(","):
+                if "=" in pair:
+                    name, value = pair.split("=", 1)
+                    rev.setdefault("normal", {})[name.strip()] = value.strip()
+    elif action == "import":
+        pass                     # 上面已经解析并写进 payload
+    else:
+        print(f"[错误] 未知操作：{action}")
+        return 1
+
+    if args.dry_run:
+        if payload["tag_review"]:
+            print(f"[预演] 时间线 {len(payload['tag_review'])} 条，最后一条："
+                  f"{json.dumps(payload['tag_review'][-1], ensure_ascii=False)}")
+        print(f"[预演] 题目 {len(payload['problem_review'])} 道")
+        return 0
+    try:
+        upload_review(client, payload)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+    print(f"[OK] 已上传 tag {tag_id}：时间线 {len(payload['tag_review'])} 条，"
+          f"题目 {len(payload['problem_review'])} 道")
+    print(f"[链接] {client.base}/review/user_tag/edit?user_id={user_id}&tag_id={tag_id}")
     return 0
 
 
@@ -3799,6 +4367,18 @@ def build_parser():
     p.add_argument("-k", "--keep", action="store_true", help="保留可执行文件")
     p.set_defaults(func=cmd_run)
 
+    p = sub.add_parser("stress", parents=[common, cfgopt],
+                       help="对拍：随机数据跑正解 vs 暴力，不一致就保存用例")
+    p.add_argument("id", nargs="?", help="题目 ID / 题号，或直接给目录")
+    p.add_argument("-s", "--solution", help="正解代码（默认 pick 就是 pull 那份）")
+    p.add_argument("-b", "--brute", help="暴力代码（文件名含 brute/baoli/bf 可自动识别）")
+    p.add_argument("-g", "--gen", help="数据生成器（文件名含 gen/maker/rand 可自动识别）")
+    p.add_argument("-n", "--times", type=int, default=200, help="对拍轮数，默认 200")
+    p.add_argument("--tl", type=float, default=5.0, help="单次限时秒数，默认 5")
+    p.add_argument("--std", default="c++17", help="编译标准，默认 c++17")
+    p.add_argument("--dir", help="失败用例保存目录（默认 <题目目录>/stress）")
+    p.set_defaults(func=cmd_stress)
+
     p = sub.add_parser("paper", parents=[common, cfgopt], help="纸面题：get 备份答案图 / submit 上传 / restore 还原")
     p.add_argument("action", choices=["get", "submit", "restore"],
                    help="get=下载当前答案图片，submit=上传图片，restore=把备份图传回去")
@@ -3825,6 +4405,7 @@ def build_parser():
     p.add_argument("-t", "--tweak", help="调整和补充")
     p.add_argument("--type", choices=["day", "week"], default="day", help="day 日计划（默认）/ week 周计划")
     p.add_argument("--user", type=int, help="用户 ID（默认自己）")
+    p.add_argument("--no-titles", action="store_true", help="show 时不查题目名（省几次请求）")
     p.add_argument("-n", "--dry-run", action="store_true", help="只显示将要提交的内容")
     p.set_defaults(func=cmd_plan)
 
@@ -3841,13 +4422,23 @@ def build_parser():
     p.set_defaults(func=cmd_submissions)
 
     p = sub.add_parser("review", parents=[common, cfgopt],
-                       help="比赛复盘表：add 记一场（自动带排名/总分/各题得分）")
-    p.add_argument("action", nargs="?", default="list", choices=["add", "list", "show"])
-    p.add_argument("contest", nargs="?", help="比赛编号或名称关键字")
-    p.add_argument("-v", "--verdict", help="结论，如 正常/崩了/题读错")
-    p.add_argument("-m", "-n", "--note", dest="note", help="复盘内容（失误与教训）")
-    p.add_argument("--user", type=int, help="用户 ID（默认自己）")
-    p.add_argument("--limit", type=int, default=20, help="list 显示条数，默认 20")
+                       help="站点复盘（tag）：show / export 导出 md / new 空模板 / import 上传 md")
+    p.add_argument("action", nargs="?", default="show",
+                   choices=["show", "html", "export", "new", "import", "timeline", "set", "add"])
+    p.add_argument("tag", help="tag_id，或直接粘 .../review/user_tag/edit?user_id=..&tag_id=.. 的 URL")
+    p.add_argument("-i", "--index", type=int, help="timeline：第几行（从 1 开始）")
+    p.add_argument("-o", "--output", help="export/new：保存的 md 路径（默认 reviews/<tag>.md）")
+    p.add_argument("-f", "--file", help="import：要上传的 md 文件；export/new 也可用它指定路径")
+    p.add_argument("--user", type=int, help="用户 ID（默认自己，URL 里有就用 URL 的）")
+    p.add_argument("-t", "--time", help="时间线时间，如 14:30（默认当前时间）")
+    p.add_argument("-p", "--plan", help="时间线：计划")
+    p.add_argument("-a", "--achieve", help="时间线：完成情况")
+    p.add_argument("-q", "--problem", help="set：题目名 / Sxx 编号 / 题目 id")
+    p.add_argument("--rethink", help="set：数据、探索和反思")
+    p.add_argument("--other", help="set：其他情况")
+    p.add_argument("--guess", type=int, help="set：赛后估分")
+    p.add_argument("--normal", help='set：常规检查，逗号分隔，如 "time=done,test=skip"')
+    p.add_argument("-n", "--dry-run", action="store_true", help="只打印将要上传的 JSON")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("help", parents=[cfgopt], help="查看帮助（help 总览 / help <命令>）")
@@ -3884,7 +4475,8 @@ def build_parser():
     p.add_argument("-l", "--lang", help="语言，如 cpp17 / cpp14 / cpp；默认用 config.json 的 language")
     p.add_argument("-n", "--dry-run", action="store_true", help="只显示将要提交的内容，不真正提交")
     p.add_argument("--no-wait", action="store_true", help="外站题提交后不等待结果，直接返回")
-    p.add_argument("--wait", type=float, default=180.0, help="外站题等待结果的秒数，默认 180")
+    p.add_argument("--no-watch", action="store_true", help="提交后不跟进评测状态（默认会跟进）")
+    p.add_argument("--wait", type=float, default=180.0, help="等待结果/跟进的秒数，默认 180")
     p.add_argument("--via", choices=["vjudge", "7fa4"], default="vjudge",
                    help="外站题提交路径：vjudge=直连 vjudge（AC 才同步到 7FA4，默认），7fa4=走站点代理")
     p.add_argument("--no-push", action="store_true", help="外站题即使 AC 也不同步到 7FA4")
