@@ -130,10 +130,22 @@ using namespace std;
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-
+{{freopen}}
     return 0;
 }
 """
+
+# 题面里判断输入输出方式的写法（文件 IO 的题必须 freopen）
+IO_IN_PATTERNS = (
+    r"输入文件(?:名)?\s*(?:为|是)?\s*[:：]?\s*([\w\-.]+\.(?:in|txt|dat))",
+    r"从文件\s*([\w\-.]+\.(?:in|txt|dat))\s*(?:中)?(?:读|输入)",
+    r"(?:input|in)\s*file(?:name)?\s*(?:is)?\s*[:：]\s*([\w\-.]+\.(?:in|txt|dat))",
+)
+IO_OUT_PATTERNS = (
+    r"输出文件(?:名)?\s*(?:为|是)?\s*[:：]?\s*([\w\-.]+\.(?:out|ans|txt))",
+    r"输出(?:到|至|入)\s*文件\s*([\w\-.]+\.(?:out|ans|txt))",
+    r"(?:output|out)\s*file(?:name)?\s*(?:is)?\s*[:：]\s*([\w\-.]+\.(?:out|ans|txt))",
+)
 
 
 # ---------------------------------------------------------------- 工具
@@ -301,8 +313,59 @@ def resolve_template_file(explicit=None):
     return None
 
 
+def detect_io(markdown):
+    """从题面猜输入输出：文件 IO 返回 {'mode':'file','input':..,'output':..}。"""
+    text = markdown or ""
+
+    def find(patterns):
+        for pattern in patterns:
+            m = re.search(pattern, text, re.I)
+            if m:
+                return m.group(1).strip()
+        return ""
+
+    infile = find(IO_IN_PATTERNS)
+    outfile = find(IO_OUT_PATTERNS)
+    if infile and not outfile:
+        outfile = os.path.splitext(infile)[0] + ".out"
+    elif outfile and not infile:
+        infile = os.path.splitext(outfile)[0] + ".in"
+    if not infile and not outfile:
+        return {"mode": "stdin", "input": "", "output": ""}
+    return {"mode": "file", "input": infile, "output": outfile}
+
+
+def io_freopen(io):
+    """生成 freopen 片段，供模板占位符 {{freopen}} 使用。"""
+    if not io or io.get("mode") != "file":
+        return ""
+    lines = []
+    if io.get("input"):
+        lines.append(f'    freopen("{io["input"]}", "r", stdin);')
+    if io.get("output"):
+        lines.append(f'    freopen("{io["output"]}", "w", stdout);')
+    return "\n".join(lines)
+
+
+def problem_io(folder):
+    """读本地题目目录 meta.json 里记录的输入输出方式。"""
+    fallback = {"mode": "stdin", "input": "", "output": ""}
+    if not folder:
+        return fallback
+    path = os.path.join(folder, "meta.json")
+    if not os.path.exists(path):
+        return fallback
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return fallback
+    io = data.get("io")
+    return io if isinstance(io, dict) and io.get("mode") else fallback
+
+
 def render_template(text, values):
-    """支持 {{id}} {{title}} {{short}} {{url}} {{date}} 占位符。"""
+    """支持 {{id}} {{title}} {{short}} {{url}} {{date}} {{infile}} {{outfile}} {{freopen}} 占位符。"""
     for key, value in values.items():
         text = text.replace("{{%s}}" % key, str(value))
     return text
@@ -1138,6 +1201,7 @@ def cmd_pull(args):
                 unzipped.append(os.path.basename(name))
     # 4) C++ 文件（用自定义模板，没配置则用内置模板）
     no, title = split_problem_name(label)
+    io_info = detect_io(markdown)
     cpp_path = os.path.join(folder, f"{short}.cpp")
     created = False
     if args.force or not os.path.exists(cpp_path):
@@ -1156,7 +1220,14 @@ def cmd_pull(args):
             "url": meta["url"],
             "no": no,
             "date": datetime.date.today().isoformat(),
+            "infile": io_info.get("input", ""),
+            "outfile": io_info.get("output", ""),
+            "io_mode": io_info.get("mode", "stdin"),
+            "freopen": io_freopen(io_info),
         })
+        if io_info.get("mode") == "file" and "{{freopen}}" not in tpl_text:
+            print(f"[提示] 这是文件 IO 题，但模板里没有 {{{{freopen}}}} 占位符；"
+                  f"手动加一行 freopen(\"{io_info.get('input')}\", \"r\", stdin) 即可")
         write_text(cpp_path, content)
         created = True
         tpl_desc = tpl_file or "内置模板"
@@ -1165,7 +1236,7 @@ def cmd_pull(args):
     # 5) 元信息
     meta_out = dict(meta)
     meta_out.update({"no": no, "short": short, "cpp": os.path.relpath(cpp_path),
-                     "folder": os.path.relpath(folder)})
+                     "folder": os.path.relpath(folder), "io": io_info})
     if vj_url:
         meta_out["vjudge"] = vj_url
     write_text(os.path.join(folder, "meta.json"), json.dumps(meta_out, ensure_ascii=False, indent=2) + "\n")
@@ -1183,6 +1254,10 @@ def cmd_pull(args):
 
     print(f"[目录] {folder}")
     print(f"[题面] statement.md")
+    if io_info.get("mode") == "file":
+        print(f"[输入输出] 文件：{io_info.get('input')} -> {io_info.get('output')}（模板里的 {{{{freopen}}}} 已填好）")
+    else:
+        print("[输入输出] 标准输入输出")
     if samples:
         print(f"[样例] {len(samples)} 个块 -> samples/sample<i>.in|.out")
     if unzipped:
@@ -1229,7 +1304,21 @@ def latest_submission_id(client, submitter):
     return max(ids) if ids else 0
 
 
-RUNNING_WORDS = {"judging", "compiling", "running", "waiting", "pending", "queued", "rejudging"}
+PENDING_WORDS = {"judging", "compiling", "running", "waiting", "pending", "queued", "rejudging",
+                 "submitted", "captcha required", "等待评测", "评测中", "等待", "排队中"}
+
+
+def result_state(item):
+    """从 /submissions 的一条里取 (状态文字, 是否出结果, 分数, 用时, 内存)，None 一律当没有。"""
+    result = (item or {}).get("result") or {}
+    running = bool((item or {}).get("running"))
+    text = str(result.get("result") or "").strip()
+    if not text:
+        text = "评测中" if running else "等待评测"
+    final = text.lower() not in PENDING_WORDS and text not in PENDING_WORDS
+    score = result.get("score")
+    score_text = f"{score:g}" if isinstance(score, (int, float)) else "-"
+    return text, final, score_text, result.get("time"), result.get("memory")
 
 
 def follow_submission(client, submitter, baseline, wait=180.0, interval=1.5):
@@ -1256,15 +1345,13 @@ def follow_submission(client, submitter, baseline, wait=180.0, interval=1.5):
                 continue
 
         item = fetch_submission_item(client, sid)
-        result = (item or {}).get("result") or {}
-        running = bool((item or {}).get("running"))
-        status = (result.get("result") or "").strip() or ("评测中" if running else "等待评测")
+        status, final, score_text, time_ms, memory_kb = result_state(item)
         if status != last:
             print(f"[状态] {status}")
             last = status
-        if status.lower() not in RUNNING_WORDS and not running:
-            print(f"[评测] {status}  分数 {result.get('score')}  "
-                  f"用时 {result.get('time')} ms  内存 {result.get('memory')} KB")
+        if final:
+            print(f"[评测] {status}  分数 {score_text}  "
+                  f"用时 {time_ms or 0} ms  内存 {memory_kb or 0} KB")
             return status
         time.sleep(interval)
 
@@ -2277,21 +2364,46 @@ def cmd_run(args):
     print("[编译] 通过")
 
     # 4) 跑样例
+    io_info = problem_io(folder)
+    file_io = io_info.get("mode") == "file" and bool(io_info.get("input") or io_info.get("output"))
+    if file_io:
+        print(f"[输入输出] 文件模式：{io_info.get('input') or '(不给输入文件)'} -> "
+              f"{io_info.get('output') or '(写到 stdout)'}（每组样例会先复制到该文件）")
     passed = 0
     print(f"[样例] 共 {len(cases)} 组")
     for idx, (name, in_path, expected) in enumerate(cases, 1):
         with open(in_path, "rb") as f:
             in_data = f.read()
+
+        workdir = None
+        stdin_data = in_data
+        if file_io:
+            workdir = tempfile.mkdtemp(prefix="7fa4_io_")
+            if io_info.get("input"):
+                with open(os.path.join(workdir, io_info["input"]), "wb") as f:
+                    f.write(in_data)
+                stdin_data = b""
         start = time.perf_counter()
         try:
-            p = subprocess.run([exe_path], input=in_data, capture_output=True, timeout=args.time_limit)
+            p = subprocess.run([os.path.abspath(exe_path)], input=stdin_data, capture_output=True,
+                               timeout=args.time_limit, cwd=workdir)
             elapsed = time.perf_counter() - start
-            out = p.stdout.decode("utf-8", "replace")
+            stdout_bytes = p.stdout
+            if workdir and io_info.get("output"):
+                produced = os.path.join(workdir, io_info["output"])
+                if os.path.exists(produced):
+                    with open(produced, "rb") as f:
+                        stdout_bytes = f.read()
+            out = stdout_bytes.decode("utf-8", "replace")
             err = p.stderr.decode("utf-8", "replace")
             rc = p.returncode
         except subprocess.TimeoutExpired:
+            if workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
             print(f"  [{idx}/{len(cases)}] {name}  TLE  >{args.time_limit:g}s")
             continue
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
         # 用户输出 / 错误落到样例同目录：<名>.out、<名>.err
         sample_dir = os.path.dirname(in_path)
@@ -2302,7 +2414,7 @@ def cmd_run(args):
         err_file = os.path.join(sample_dir, stem + ".err")
         try:
             with open(out_file, "wb") as f:
-                f.write(p.stdout)
+                f.write(stdout_bytes)
             with open(err_file, "wb") as f:
                 f.write(p.stderr)
         except OSError as exc:
@@ -2368,17 +2480,42 @@ def find_stress_file(folder, explicit, kind, exclude=()):
     return None
 
 
-def run_cpp(exe, in_data, timeout, argv=None):
+def run_cpp(exe, in_data, timeout, argv=None, cwd=None):
     """跑一次程序，返回 (stdout, stderr, 耗时, 错误类型或 None)。"""
     start = time.perf_counter()
     try:
         p = subprocess.run([exe] + list(argv or []), input=in_data,
-                           capture_output=True, timeout=timeout)
+                           capture_output=True, timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired:
         return b"", b"", time.perf_counter() - start, "TLE"
     except OSError as exc:
         return b"", str(exc).encode(), time.perf_counter() - start, "RE"
     return p.stdout, p.stderr, time.perf_counter() - start, (None if p.returncode == 0 else f"RE {p.returncode}")
+
+
+def run_with_io(exe, in_data, timeout, io=None, argv=None, produce_input=False):
+    """跑程序并处理文件 IO：输入写进 .in 文件、输出从 .out 文件读回。
+
+    produce_input=True 用于数据生成器：不给它输入，改从它写出的输入文件里取结果。
+    """
+    if not io or io.get("mode") != "file":
+        return run_cpp(exe, in_data, timeout, argv)
+    workdir = tempfile.mkdtemp(prefix="7fa4_io_")
+    try:
+        if not produce_input and io.get("input"):
+            with open(os.path.join(workdir, io["input"]), "wb") as f:
+                f.write(in_data)
+        stdin_data = b"" if io.get("input") else in_data
+        stdout, stderr, elapsed, etype = run_cpp(exe, stdin_data, timeout, argv, cwd=workdir)
+        target = io.get("input") if produce_input else io.get("output")
+        if target:
+            produced = os.path.join(workdir, target)
+            if os.path.exists(produced):
+                with open(produced, "rb") as f:
+                    stdout = f.read()
+        return stdout, stderr, elapsed, etype
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def first_diff_line(text_a, text_b):
@@ -2457,8 +2594,11 @@ def cmd_stress(args):
                 pass
         exes[key] = exe
 
+    io_info = problem_io(folder)
     print(f"[对拍] 正解={os.path.basename(solution)}  暴力={os.path.basename(brute)}  "
           f"生成器={os.path.basename(gen)}")
+    if io_info.get("mode") == "file":
+        print(f"[对拍] 文件 IO：{io_info.get('input')} -> {io_info.get('output')}")
     print(f"[对拍] {args.times} 轮，单次限时 {args.tl:g}s")
 
     fail_dir = args.dir or os.path.join(folder, "stress")
@@ -2466,15 +2606,16 @@ def cmd_stress(args):
     max_sol = 0.0
 
     for i in range(1, args.times + 1):
-        # 生成器把轮次当随机种子传进 argv[1]，读 stdin 也照常可用
-        out, err, _, etype = run_cpp(exes["gen"], b"", args.tl, argv=[str(i)])
+        # 生成器把轮次当随机种子传进 argv[1]；文件 IO 的题从它写出的输入文件取数据
+        out, err, _, etype = run_with_io(exes["gen"], b"", args.tl, io_info, argv=[str(i)],
+                                         produce_input=True)
         if etype:
             print(f"[错误] 生成器第 {i} 轮失败：{etype}")
             print(normalize_output(err.decode("utf-8", "replace"))[:500])
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return 1
 
-        got, gerr, elapsed, etype = run_cpp(exes["sol"], out, args.tl)
+        got, gerr, elapsed, etype = run_with_io(exes["sol"], out, args.tl, io_info)
         max_sol = max(max_sol, elapsed)
         if etype:
             print(f"  [{i}] 正解 {etype}（{elapsed:.3f}s），保存用例")
@@ -2482,7 +2623,7 @@ def cmd_stress(args):
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return 1
 
-        want, _, _, betype = run_cpp(exes["brute"], out, args.tl)
+        want, _, _, betype = run_with_io(exes["brute"], out, args.tl, io_info)
         if betype:
             print(f"  [{i}] 暴力 {betype}，跳过（可能是暴力太慢或数据超范围）")
             continue
@@ -2745,6 +2886,429 @@ def fetch_user_plan(client, user_id, day, ptype="day"):
     if not data.get("success"):
         raise RuntimeError(f"读取计划失败：{data.get('err') or data}")
     return (data.get("user_plan") or {}), ts
+
+
+def page_body_text(html):
+    """去掉导航/弹窗这些公共部分，只留正文文本。"""
+    text = strip_tags(re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html))
+    marker = "跳转到页面"
+    if marker in text:
+        text = text.split(marker)[-1]
+    return text.strip()
+
+
+# ---------------------------------------------------------------- 好友 / 聊天
+def chat_info(client):
+    """GET /chat/info -> {user, limit, groups, friends}"""
+    r = client.get("/chat/info")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"聊天接口返回异常（HTTP {r.status_code}）")
+    if not data.get("success"):
+        err = data.get("err") or {}
+        raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err) or "读取联系人失败")
+    return data
+
+
+def friend_relation(item):
+    watcher, watchee = item.get("watcher"), item.get("watchee")
+    if watcher and watchee:
+        return "双向"
+    if watcher:
+        return "我关注"
+    if watchee:
+        return "关注我"
+    return ""
+
+
+def friend_label(item):
+    name = item.get("nickname") or item.get("username") or str(item.get("id"))
+    real = item.get("real_name") or ""
+    return f"{name}（{real}）" if real and real != name else name
+
+
+def cmd_friends(args):
+    """好友/关注列表：默认只看有关系的，--all 看全部。"""
+    client = make_client(args)
+    client.load_session()
+    try:
+        data = chat_info(client)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+
+    friends = data.get("friends") or []
+    groups = data.get("groups") or []
+    keyword = (args.search or "").strip().lower()
+
+    pool = friends if args.all else [f for f in friends if friend_relation(f)]
+    if keyword:
+        pool = [f for f in pool
+                if keyword in " ".join(str(f.get(k) or "") for k in
+                                       ("username", "nickname", "real_name", "grade")).lower()]
+    if not args.groups:
+        counts = {}
+        for item in friends:
+            key = friend_relation(item)
+            counts[key] = counts.get(key, 0) + 1
+        order = {"双向": 0, "我关注": 1, "关注我": 2, "": 3}
+        pool.sort(key=lambda f: (order.get(friend_relation(f), 3),
+                                 str(f.get("nickname") or f.get("username") or "")))
+        print(f"[好友] 双向 {counts.get('双向', 0)}  关注我 {counts.get('关注我', 0)}  "
+              f"我关注 {counts.get('我关注', 0)}  显示 {min(len(pool), args.limit)} 条")
+        for item in pool[: args.limit]:
+            print(f"  {pad(str(item.get('id')), 6)} {pad(friend_label(item), 24)} "
+                  f"{pad(item.get('grade') or '', 6)} {friend_relation(item)}")
+    if groups and (args.groups or not args.groups):
+        if not args.groups:
+            print()
+        print(f"[群] {len(groups)} 个")
+        for group in groups:
+            members = len(group.get("users") or [])
+            print(f"  {pad(str(group.get('id')), 6)} {pad(group.get('title') or '', 24)} "
+                  f"{members} 人")
+    if pool and not args.groups and len(pool) > args.limit:
+        print(f"[提示] 还有 {len(pool) - args.limit} 条，用 -n 调大或 --search 过滤")
+    return 0
+
+
+def resolve_chat_target(data, token, self_id=None):
+    """把 昵称/账号/群名/ID 解析成 (type, id, 显示名)。"""
+    token = (token or "").strip()
+    friends = data.get("friends") or []
+    groups = data.get("groups") or []
+
+    if token in ("自己", "me", "self") and self_id:
+        return "user", self_id, "我自己"
+    if token.isdigit():
+        for item in friends:
+            if str(item.get("id")) == token:
+                return "user", item["id"], friend_label(item)
+        for group in groups:
+            if str(group.get("id")) == token:
+                return "group", group["id"], group.get("title") or token
+        if self_id and str(self_id) == token:
+            return "user", self_id, "我自己"
+        raise RuntimeError(f"没有 id 为 {token} 的联系人或群")
+
+    low = token.lower()
+
+    def hit(items, keys):
+        return [i for i in items
+                if any(low in str(i.get(k) or "").lower() for k in keys)]
+
+    found = hit(friends, ("username", "nickname", "real_name"))
+    if len(found) == 1:
+        item = found[0]
+        return "user", item["id"], friend_label(item)
+    if len(found) > 1:
+        print(f"[错误] 「{token}」匹配到 {len(found)} 个人，用 id 或更精确的昵称：")
+        for item in found[:10]:
+            print(f"  {item.get('id')}  {friend_label(item)}  @{item.get('username')}")
+        raise RuntimeError("目标不唯一")
+
+    found = hit(groups, ("title",))
+    if len(found) == 1:
+        return "group", found[0]["id"], found[0].get("title") or token
+    if len(found) > 1:
+        print(f"[错误] 「{token}」匹配到 {len(found)} 个群：")
+        for group in found[:10]:
+            print(f"  {group.get('id')}  {group.get('title')}")
+        raise RuntimeError("目标不唯一")
+    raise RuntimeError(f"找不到联系人/群：{token}")
+
+
+def parse_chat_content(raw):
+    """content 是 JSON 字符串：{type: text/image/pat/...}"""
+    try:
+        payload = json.loads(raw or "")
+    except ValueError:
+        return "text", str(raw or "")
+    if not isinstance(payload, dict):
+        return "text", str(payload)
+    kind = payload.get("type") or "text"
+    if kind == "text":
+        return kind, payload.get("content") or ""
+    if kind == "image":
+        return kind, "[图片]"
+    if kind == "pat":
+        target = payload.get("target")
+        return kind, f"[拍一拍 {target}]" if target else "[拍一拍]"
+    return kind, f"[{kind}]"
+
+
+def cmd_chat(args):
+    """聊天：列表 / 看消息 / 发消息 / 发求助 / 同意求助。"""
+    client = make_client(args)
+    client.load_session()
+    try:
+        data = chat_info(client)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+
+    if not args.target:
+        friends = data.get("friends") or []
+        groups = data.get("groups") or []
+        limit = data.get("limit") or {}
+        counts = {}
+        for item in friends:
+            key = friend_relation(item)
+            counts[key] = counts.get(key, 0) + 1
+        print(f"[聊天] 好友 {len(friends)}（双向 {counts.get('双向', 0)} / "
+              f"关注我 {counts.get('关注我', 0)} / 我关注 {counts.get('我关注', 0)}）  "
+              f"群 {len(groups)}")
+        if limit:
+            print(f"[限制] 每 {limit.get('time_limit')} 秒最多 {limit.get('count_limit')} 条，"
+                  f"单条上限 {limit.get('length_limit')} 字符")
+        print("看消息：chat <昵称/群名> [-n 20]")
+        print("发消息：chat <昵称> -m \"内容\"")
+        print("发求助：chat <昵称> --ask \"哪道题/什么问题\"")
+        print("同意求助：chat <昵称> --accept [-m \"说明\"]")
+        return 0
+
+    uid = (data.get("user") or {}).get("id")
+    try:
+        ttype, tid, name = resolve_chat_target(data, args.target, uid)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+    names = {item.get("id"): friend_label(item) for item in (data.get("friends") or [])}
+
+    if args.message is not None or args.ask is not None or args.accept:
+        if args.ask is not None:
+            content = f"【求助】{args.ask.strip()}"
+        elif args.accept:
+            content = "【同意求助】" + (f"\n{args.message.strip()}" if args.message else "")
+        else:
+            content = args.message or ""
+        if not content.strip():
+            print("[错误] 内容为空")
+            return 1
+        print(f"[发送] {name}（{ttype}#{tid}）")
+        print(f"       {content}")
+        if args.dry_run:
+            print("[预演] 未发送")
+            return 0
+        try:
+            r = client.request("post", "/chat/chat",
+                               data={"type": ttype, "target_id": tid, "content": content})
+            ret = r.json()
+        except (RuntimeError, ValueError) as exc:
+            print(f"[错误] 发送失败：{exc}")
+            return 1
+        if not ret.get("success"):
+            err = ret.get("err") or {}
+            print(f"[失败] {err.get('message') if isinstance(err, dict) else err}")
+            return 1
+        print("[OK] 已发送")
+        return 0
+
+    try:
+        r = client.get("/chat/chat", params={"type": ttype, "target_id": tid, "take": args.limit})
+        ret = r.json()
+    except (RuntimeError, ValueError) as exc:
+        print(f"[错误] 拉取消息失败：{exc}")
+        return 1
+    if not ret.get("success"):
+        err = ret.get("err") or {}
+        print(f"[失败] {err.get('message') if isinstance(err, dict) else err}")
+        return 1
+
+    chats = ret.get("chats") or []
+    print(f"[聊天] {name}（{ttype}#{tid}）最近 {len(chats)} 条")
+    for msg in chats:
+        kind, body = parse_chat_content(msg.get("content"))
+        when = datetime.datetime.fromtimestamp(msg.get("send_time") or 0).strftime("%m-%d %H:%M")
+        sender = "我" if msg.get("sender_id") == uid else names.get(msg.get("sender_id"), f"#{msg.get('sender_id')}")
+        body = body.replace("\n", " ⏎ ")
+        print(f"  {when}  {pad(sender, 14)} {body[:160]}")
+    if not chats:
+        print("  （还没有消息）")
+    return 0
+
+
+def cmd_contest(args):
+    """模测：不给参数列最近几场，给编号/名称看详情与我的成绩。"""
+    client = make_client(args)
+    client.load_session()
+
+    html = client.get("/contests").text
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
+        m = re.search(r'href="/contest/(\d+)"[^>]*>([\s\S]*?)</a>', tr)
+        if not m:
+            continue
+        cid = m.group(1)
+        name = re.sub(r"\s*(已结束|未开始|进行中)\s*$", "", strip_tags(m.group(2))).strip()
+        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+        head = cells[0] if cells else ""
+        status = ("已结束" if "已结束" in head else "未开始" if "未开始" in head
+                  else "进行中" if "进行中" in head else "")
+        rows.append({"id": cid, "name": name, "status": status,
+                     "start": cells[1] if len(cells) > 1 else "",
+                     "duration": cells[2] if len(cells) > 2 else ""})
+
+    if not args.id:
+        show = rows[: args.limit]
+        print(f"[模测] 共 {len(rows)} 场（显示最近 {len(show)} 场）")
+        for row in show:
+            print(f"  {pad(row['id'], 7)} {pad(row['name'], 24)} {pad(row['status'], 6)} "
+                  f"{pad(row['start'], 20)} {row['duration']}")
+        print("[提示] 详情：contest <编号或名称>")
+        return 0
+
+    token = str(args.id).strip()
+    target = None
+    if token.isdigit():
+        target = next((r for r in rows if r["id"] == token), None)
+    else:
+        hit = [r for r in rows if token.lower() in r["name"].lower()]
+        if len(hit) > 1:
+            print(f"[错误] 匹配到 {len(hit)} 场，用编号更准：")
+            for r in hit[:10]:
+                print(f"  {r['id']}  {r['name']}  {r['status']}")
+            return 1
+        target = hit[0] if hit else None
+    if not target:
+        print(f"[错误] 没有匹配的模测：{token}")
+        return 1
+
+    cid = target["id"]
+    detail = client.get(f"/contest/{cid}").text
+    problems = []
+    seen = set()
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", detail):
+        m = re.search(r'href="/contest/%s/problem/(\d+)"[^>]*>([\s\S]*?)</a>' % cid, tr)
+        if not m or m.group(1) in seen:
+            continue
+        seen.add(m.group(1))
+        problems.append((m.group(1), strip_tags(m.group(2))))
+    problems.sort(key=lambda x: int(x[0]) if x[0].isdigit() else 0)
+
+    print(f"[模测] {target['name']}  {target['status']}  {target['start']}  {target['duration']}")
+    print(f"[链接] {client.base}/contest/{cid}")
+    if problems:
+        print(f"[题目] {len(problems)} 道")
+        for no, label in problems:
+            print(f"  {pad(label, 28)} {client.base}/contest/{cid}/problem/{no}")
+
+    try:
+        me = client.get(f"/contest/{cid}/ranklist").text
+    except RuntimeError:
+        me = ""
+    uid = load_config().get("user_id")
+    mine = None
+    if me and uid:
+        for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", me):
+            if f"/user/{uid}" not in tr:
+                continue
+            tds = re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)
+            if len(tds) < 4:
+                continue
+
+            def score_of(cell):
+                m = re.search(r'class="score[^"]*"[^>]*>\s*([\d.]+)', cell)
+                return m.group(1) if m else "-"
+
+            mine = {"rank": re.sub(r"[^\d]", "", strip_tags(tds[0])) or "-",
+                    "per": [score_of(td) for td in tds[3:-1]],
+                    "total": score_of(tds[-1])}
+            break
+    if mine:
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        detail_scores = " ".join(
+            f"{letters[i] if i < len(letters) else i + 1}{score}"
+            for i, score in enumerate(mine["per"]))
+        print(f"[我的] 排名 {mine['rank']}  总分 {mine['total']}  各题 {detail_scores}")
+    else:
+        print("[我的] 排行榜里没有你的成绩（可能没参加）")
+    print(f"[排行] {client.base}/contest/{cid}/ranklist")
+    return 0
+
+
+def cmd_progress(args):
+    """进度排行：/ranklist?default=1 的表格。"""
+    client = make_client(args)
+    client.load_session()
+    html = client.get("/ranklist", params={"default": 1}).text
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
+        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+        if len(cells) >= 6 and cells[0].isdigit():
+            rows.append(cells)
+    if not rows:
+        print("[错误] 没能解析进度表")
+        return 1
+
+    submitter = ""
+    try:
+        submitter = current_submitter(client)
+    except RuntimeError:
+        pass
+    if args.me:
+        rows = [r for r in rows if submitter and submitter in r]
+        if not rows:
+            print("[进度] 这张表里没有你的记录")
+            return 1
+
+    show = rows[: args.limit] if not args.me else rows
+    print(f"[进度] 共 {len(rows)} 人（显示 {len(show)} 人）")
+    for cells in show:
+        mark = " *" if submitter and submitter in cells else ""
+        print(f"  {pad(cells[0], 5)} {pad(cells[2], 16)} {pad(cells[5] if len(cells) > 5 else '', 6)} "
+              f"通过 {pad(cells[6] if len(cells) > 6 else '-', 6)} "
+              f"积分 {pad(cells[7] if len(cells) > 7 else '-', 6)}{mark}")
+    return 0
+
+
+def cmd_article(args):
+    """读帖子/帮助：article <编号或 URL>。"""
+    client = make_client(args)
+    client.load_session()
+    token = str(args.id).strip()
+    m = re.search(r"/article/(\d+)", token)
+    aid = m.group(1) if m else (token if token.isdigit() else None)
+    if not aid:
+        print(f"[错误] 需要文章编号：article 124")
+        return 1
+    html = client.get(f"/article/{aid}").text
+    if "错误 - 7FA4" in html:
+        print(f"[错误] 文章 {aid} 不存在或无权查看")
+        return 1
+    body = page_body_text(html)
+    for tail in ("蜀ICP备", "Powered by"):
+        if tail in body:
+            body = body.split(tail)[0]
+    print(f"[文章] #{aid}  {client.base}/article/{aid}")
+    print("-" * 60)
+    print(body.strip()[:6000])
+    print("-" * 60)
+    return 0
+
+
+def cmd_prints(args):
+    """提交打印队列：/prints/html。"""
+    client = make_client(args)
+    client.load_session()
+    html = client.get("/prints/html").text
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html):
+        cells = [strip_tags(c) for c in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+        if len(cells) >= 6 and cells[0] and cells[0] not in ("姓名", "提交"):
+            rows.append(cells)
+    if not rows:
+        print("[打印] 队列是空的")
+        return 0
+    print(f"[打印] 共 {len(rows)} 条（显示最近 {min(len(rows), args.limit)} 条）")
+    print(f"  {pad('姓名', 8)} {pad('后缀', 6)} {pad('提交时间', 20)} "
+          f"{pad('审核时间', 20)} {pad('打印时间', 20)} 结果")
+    for cells in rows[: args.limit]:
+        name, suffix, sent, checked, printed, status = cells[:6]
+        print(f"  {pad(name, 8)} {pad(suffix, 6)} {pad(sent, 20)} "
+              f"{pad(checked, 20)} {pad(printed, 20)} {status}")
+    return 0
 
 
 def problem_titles(client, pids):
@@ -3517,14 +4081,48 @@ def cmd_submission(args):
               f"{info.get('codeSize')} 字符   提交 {info.get('submitTime')}")
         print(f"[提交者] {info.get('nickname') or info.get('uid') or info.get('user')}"
               f"（{info.get('user') or info.get('userId')}）")
-        if result:
-            print(f"[状态] {result.get('result') or '评测中'}  分数 {result.get('score')}  "
-                  f"用时 {result.get('time')} ms  内存 {result.get('memory')} KB")
+        status, final, score_text, time_ms, memory_kb = result_state(item)
+        if final:
+            print(f"[状态] {status}  分数 {score_text}  "
+                  f"用时 {time_ms or 0} ms  内存 {memory_kb or 0} KB")
         else:
-            print("[状态] " + ("评测中…" if (item or {}).get("running") else "等待评测"))
+            print(f"[状态] {status}（还没出结果）")
         print(f"[链接] {client.base}/submission/{sid}")
     else:
         print(f"[提示] /submissions/?id={sid} 里没有这条记录（可能是比赛内提交）")
+
+    # 作废 / 删除 / 重新评测（页面上的 href-post 按钮就是这三个地址）
+    actions = [("revoke", "作废", getattr(args, "revoke", False)),
+               ("deleted", "删除", getattr(args, "delete", False)),
+               ("rejudge", "重新评测", getattr(args, "rejudge", False))]
+    chosen = [(path, label) for path, label, flag in actions if flag]
+    if chosen:
+        path, label = chosen[0]
+        if not args.yes:
+            tip = "作废只是评测作废，删除后记录无法再访问" if path != "rejudge" else "会重新排队评测"
+            print(f"[确认] 即将{label}提交 #{sid}（{tip}）")
+            if not ask_continue(f"确认{label}？"):
+                print("[停止] 已取消")
+                return 0
+        url = f"{client.base}/submission/{sid}/{path}"
+        try:
+            r = client.s.post(url, timeout=client.timeout, allow_redirects=False,
+                              headers={"X-Requested-With": "XMLHttpRequest"})
+        except requests.RequestException as exc:
+            print(f"[错误] 请求失败：{exc}")
+            return 1
+        if 300 <= r.status_code < 400:
+            print(f"[OK] 已{label} #{sid} -> {r.headers.get('Location')}")
+            return 0
+        if r.status_code == 200:
+            if "错误 - 7FA4" in r.text:
+                msg = strip_tags(r.text.split("ui main container")[-1])[:200]
+                print(f"[失败] {label}被拒绝：{msg or '权限不足或状态不允许'}")
+                return 1
+            print(f"[OK] 已{label} #{sid}")
+            return 0
+        print(f"[结果] HTTP {r.status_code} {strip_tags(r.text)[:200]}")
+        return 1
 
     if not (args.code or args.save):
         print(f"[代码] 加 --code 显示，或 --save <文件> 保存")
@@ -4096,7 +4694,8 @@ def cmd_template(args):
     else:
         print(default_template_text().rstrip("\n"))
     print("-" * 60)
-    print("可用占位符：{{id}} {{no}} {{title}} {{short}} {{url}} {{date}}")
+    print("可用占位符：{{id}} {{no}} {{title}} {{short}} {{url}} {{date}} "
+          "{{infile}} {{outfile}} {{io_mode}} {{freopen}}")
     print("设置：template set <文件>；恢复：template reset")
     return 0
 
@@ -4394,6 +4993,41 @@ def build_parser():
     p.add_argument("--preview", action="store_true", help="导出后在终端画个粗略预览")
     p.set_defaults(func=cmd_export)
 
+    p = sub.add_parser("friends", parents=[common, cfgopt], help="好友/关注列表（含群）")
+    p.add_argument("-n", "--limit", type=int, default=30, help="显示条数，默认 30")
+    p.add_argument("--all", action="store_true", help="连没有关注关系的也列出来")
+    p.add_argument("--search", help="按账号/昵称/姓名/年级过滤")
+    p.add_argument("--groups", action="store_true", help="只看群")
+    p.set_defaults(func=cmd_friends)
+
+    p = sub.add_parser("chat", parents=[common, cfgopt],
+                       help="聊天：看消息 / 发消息 / 发求助 / 同意求助")
+    p.add_argument("target", nargs="?", help="昵称 / 账号 / 群名 / id（不填则显示概览）")
+    p.add_argument("-n", "--limit", type=int, default=20, help="拉取最近多少条，默认 20")
+    p.add_argument("-m", "--message", help="发送的内容")
+    p.add_argument("--ask", help="发求助：内容自动加【求助】前缀")
+    p.add_argument("--accept", action="store_true", help="同意求助：发送【同意求助】")
+    p.add_argument("--dry-run", action="store_true", help="只显示要发的内容，不提交")
+    p.set_defaults(func=cmd_chat)
+
+    p = sub.add_parser("contest", parents=[common, cfgopt], help="模测：列表 / 详情（题目 + 我的成绩）")
+    p.add_argument("id", nargs="?", help="比赛编号或名称关键字（不给则列最近几场）")
+    p.add_argument("-n", "--limit", type=int, default=15, help="列表显示场次，默认 15")
+    p.set_defaults(func=cmd_contest)
+
+    p = sub.add_parser("progress", parents=[common, cfgopt], help="进度排行（/ranklist，通过数/积分）")
+    p.add_argument("-n", "--limit", type=int, default=30, help="显示前多少名，默认 30")
+    p.add_argument("--me", action="store_true", help="只看自己那一行")
+    p.set_defaults(func=cmd_progress)
+
+    p = sub.add_parser("article", parents=[common, cfgopt], help="读帖子/帮助（article 124）")
+    p.add_argument("id", help="文章编号或 .../article/<id> 的 URL")
+    p.set_defaults(func=cmd_article)
+
+    p = sub.add_parser("prints", parents=[common, cfgopt], help="提交打印队列（/prints/html）")
+    p.add_argument("-n", "--limit", type=int, default=20, help="显示条数，默认 20")
+    p.set_defaults(func=cmd_prints)
+
     p = sub.add_parser("plan", parents=[common, cfgopt],
                        help="计划：show 看某天 / add 写某天（today/明天/后天）")
     p.add_argument("action", nargs="?", default="show", choices=["show", "add", "edit", "home"])
@@ -4452,6 +5086,9 @@ def build_parser():
     p.add_argument("-s", "--save", help="把代码保存到文件或目录")
     p.add_argument("-y", "--yes", action="store_true", help="不再询问，直接尝试（他人提交/长代码）")
     p.add_argument("--max-chars", type=int, default=2000, help="超过多少字符先确认，默认 2000")
+    p.add_argument("-r", "--revoke", action="store_true", help="作废这条提交（POST /submission/<id>/revoke）")
+    p.add_argument("-d", "--delete", action="store_true", help="删除这条提交（POST /submission/<id>/deleted）")
+    p.add_argument("--rejudge", action="store_true", help="重新评测（POST /submission/<id>/rejudge）")
     p.set_defaults(func=cmd_submission)
 
     p = sub.add_parser("sftp", parents=[common, cfgopt],

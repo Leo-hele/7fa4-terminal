@@ -21,7 +21,13 @@
 | `task` / `tasks` | 查看 vjudge 任务 |
 | `run <题>` | 本地编译（Windows / Linux 通用）并在样例上跑，用户输出/错误写到 `<名>.out` / `<名>.err`；目录里有多份 cpp 时默认跑 `pull` 生成的那份（`-f` 指定其它） |
 | `stress <题>` | 对拍：随机数据跑「正解 vs 暴力」，不一致就保存用例（`1.in`/`sol.out`/`brute.out`） |
-| `submission <编号>` | 看提交状态、分数、时间/内存，`--code` 显示代码、`--save` 存代码（也接受 `/submissions?id=123`） |
+| `contest [比赛]` | 模测：不给参数列最近几场，给了看题目列表 + 我的排名/各题得分 |
+| `progress` | 进度排行（通过数、积分），`--me` 只看自己 |
+| `article <id>` | 读帖子/帮助/公告（也接受 `.../article/124` 的 URL） |
+| `prints` | 提交打印队列（姓名/后缀/审核/打印状态） |
+| `friends` | 好友/关注列表（双向 / 关注我 / 我关注）+ 群 |
+| `chat [联系人]` | 聊天：看消息、`-m` 发消息、`--ask` 发求助、`--accept` 同意求助 |
+| `submission <编号>` | 看提交状态、分数、时间/内存，`--code` 显示代码、`--save` 存代码；`--revoke` 作废、`--delete` 删除 |
 | `submissions` | 提交记录查询：`--page/--pages` 分页，`--problem/--submitter/--status/--language/--min-score/--max-score` 筛选 |
 | `plan [show\\|add] [日期]` | 计划按天读写：`plan show 明天`、`plan add 后天 -m "..." -p "71354"`；`plan home` 看首页概览 |
 | `review` | **站点复盘（tag）**：`show` 查看、`timeline -i N` 改时间线、`set -q 题目` 改某题，写完直接上传 |
@@ -29,7 +35,7 @@
 | `paper` | 纸面题答案图片：`get` 备份 / `submit` 上传 / `restore` 还原 |
 | `export <题>` | 题面 markdown 导出 PNG（本地图片一起嵌入） |
 | `sftp` | SFTP 存储（5307）：`login/ls/pwd/cd/lcd/lpwd/get/put/mkdir/rm/rmdir` |
-| `template` | 查看/设置代码模板（`{{id}} {{no}} {{title}} {{short}} {{url}} {{date}}`） |
+| `template` | 查看/设置代码模板（`{{id}} {{no}} {{title}} {{short}} {{url}} {{date}} {{infile}} {{outfile}} {{freopen}} {{io_mode}}`） |
 | `config` | 查看/修改本地配置（`show/get/set/unset`） |
 | `update` | 从 `update_url`（默认 `http://localhost:9080/terminal.py`）检查并更新自身 |
 | `get` / `post` / `raw` | 直接发 HTTP 请求 |
@@ -156,6 +162,64 @@ python 7fa4_terminal.py --help
 
 `cd` 会先校验目标存在且是目录；`ls` 输出目录优先，带大小和修改时间。
 
+## 好友 / 聊天
+
+```bash
+7fa4 friends                      # 关注关系汇总 + 前 30 条（双向优先）
+7fa4 friends -n 100 --search 初一  # 按账号/昵称/姓名/年级过滤
+7fa4 friends --all                # 连没有关注关系的也列（全站在线用户很大）
+7fa4 friends --groups             # 只看群
+
+7fa4 chat                         # 概览：好友/群数量 + 发言限制
+7fa4 chat 张三 -n 20              # 看最近 20 条消息
+7fa4 chat 张三 -m "在吗"          # 发普通消息
+7fa4 chat 张三 --ask "第 3 题怎么读入"   # 发求助（内容变成【求助】第 3 题怎么读入）
+7fa4 chat 张三 --accept -m "我看看"      # 同意求助（【同意求助】+ 附言）
+7fa4 chat 自己 -m "备忘"           # 给自己发（测试用，不会打扰别人）
+```
+
+接口（页面里的私有 API）：
+
+| 用途 | 接口 |
+|---|---|
+| 联系人/群 | `GET /chat/info` → `{user, limit, groups, friends}` |
+| 拉消息 | `GET /chat/chat?type=user\|group&target_id=<id>&take=N` → `{chats:[{id, content, send_time, sender_id, ...}]}` |
+| 发消息 | `POST /chat/chat` 表单 `{type, target_id, content}`，`content` 是纯文本（图片是 markdown dataURL） |
+
+注意 `content` 里存的是 JSON 字符串（`{"type":"text","content":"..."}`），`type` 支持 `text/image/pat/sticker/emoji/file`；
+工具会自动解析成可读文本。发言有频率限制（当前账号：每 2400 秒最多 4 条），`--dry-run` 可以先看要发什么。
+
+「求助 / 同意求助」都是普通文本消息加固定前缀（`【求助】` / `【同意求助】`），站点没有专门的求助消息类型，
+所以对方在网页上看到的就是一条带前缀的聊天记录。
+
+## 文件输入输出
+
+有些题要求读写文件（`freopen`），`pull` 会从题面里认出来并写进 `meta.json`：
+
+```bash
+7fa4 pull Q1.2.3.4
+# [输入输出] 文件：data.in -> data.out（模板里的 {{freopen}} 已填好）
+```
+
+识别规则：`输入文件：x.in` / `输入文件名为 x.in` / `从文件 x.in 读入` / `Input file: x.in`，
+输出同理；只写一边时另一边按扩展名推导（`.in ↔ .out`）。
+
+模板里加一行 `{{freopen}}` 即可自动插入：
+
+```cpp
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+{{freopen}}          // 文件 IO 的题会变成下面两行，标准 IO 的题是空
+    // freopen("data.in", "r", stdin);
+    // freopen("data.out", "w", stdout);
+```
+
+其他占位符：`{{infile}}` / `{{outfile}}`（文件名）、`{{io_mode}}`（`file` / `stdin`）。
+
+`run` / `stress` 会自动照顾文件 IO：把样例输入复制成 `data.in`、程序在临时目录里跑，
+再从 `data.out` 读回输出比对（不会污染题目目录）。
+
 ## 对拍
 
 ```bash
@@ -210,6 +274,11 @@ python 7fa4_terminal.py --help
 7fa4 submission /submissions?id=1048450   # 也接受这种写法
 7fa4 submission 1048450 -c           # 显示代码（超过 2000 字符会先问 y/N，-y 跳过）
 7fa4 submission 1048450 -s problems/72874_inf/   # 代码存成 submission1048450.cpp
+
+7fa4 submission 1055544 --revoke         # 作废（POST /submission/<id>/revoke，状态变 Revoke）
+7fa4 submission 1055544 --delete         # 删除（POST /submission/<id>/deleted，状态变 Deleted）
+7fa4 submission 1055544 --rejudge        # 重新评测（需要管理员权限，普通账号会被拒绝）
+7fa4 submission 1055544 --revoke -y      # 跳过确认
 ```
 
 提交详情分两步请求：
