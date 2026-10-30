@@ -135,17 +135,7 @@ int main() {
 }
 """
 
-# 题面里判断输入输出方式的写法（文件 IO 的题必须 freopen）
-IO_IN_PATTERNS = (
-    r"输入文件(?:名)?\s*(?:为|是)?\s*[:：]?\s*([\w\-.]+\.(?:in|txt|dat))",
-    r"从文件\s*([\w\-.]+\.(?:in|txt|dat))\s*(?:中)?(?:读|输入)",
-    r"(?:input|in)\s*file(?:name)?\s*(?:is)?\s*[:：]\s*([\w\-.]+\.(?:in|txt|dat))",
-)
-IO_OUT_PATTERNS = (
-    r"输出文件(?:名)?\s*(?:为|是)?\s*[:：]?\s*([\w\-.]+\.(?:out|ans|txt))",
-    r"输出(?:到|至|入)\s*文件\s*([\w\-.]+\.(?:out|ans|txt))",
-    r"(?:output|out)\s*file(?:name)?\s*(?:is)?\s*[:：]\s*([\w\-.]+\.(?:out|ans|txt))",
-)
+# 题面里判断输入输出方式的写法（见 detect_io）
 
 
 # ---------------------------------------------------------------- 工具
@@ -313,25 +303,74 @@ def resolve_template_file(explicit=None):
     return None
 
 
-def detect_io(markdown):
-    """从题面猜输入输出：文件 IO 返回 {'mode':'file','input':..,'output':..}。"""
-    text = markdown or ""
+def html_plain_text(html):
+    """HTML -> 纯文本：块级元素换行、表格单元格用空格分开，保留「输入文件：x.in」这种写法。"""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html or "")
+    text = re.sub(r"(?i)</t[dh]>", " ", text)
+    text = re.sub(r"(?i)</(p|div|tr|li|h[1-6]|table|section|pre)>", "\n", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = htmllib.unescape(text).replace("\u00a0", " ")
+    return re.sub(r"[ \t]+", " ", text)
 
-    def find(patterns):
-        for pattern in patterns:
-            m = re.search(pattern, text, re.I)
-            if m:
-                return m.group(1).strip()
-        return ""
 
-    infile = find(IO_IN_PATTERNS)
-    outfile = find(IO_OUT_PATTERNS)
+# 「输入文件：data.in」这类说法里，文件名的形态
+IO_VALUE = r"([^\s，。；、,;:：<>\"'（）()]{1,60})"
+IO_SKIP_WORDS = ("标准", "无", "不给", "省略", "同上", "格式", "说明", "文件", "以下", "见")
+
+IO_IN_PATTERNS = (
+    r"输入文件(?:名)?\s*(?:为|是)?\s*[:：]\s*" + IO_VALUE,
+    r"输入文件(?:名)\s*(?:为|是)\s*" + IO_VALUE,
+    r"输入文件(?:名)?\s+" + IO_VALUE,          # 表格里：输入文件 | seed.in
+    r"从文件\s*" + IO_VALUE + r"\s*(?:中)?(?:读|输入)",
+    r"(?:input|in)\s*file(?:name)?\s*(?:is)?\s*[:：]\s*" + IO_VALUE,
+)
+IO_OUT_PATTERNS = (
+    r"输出文件(?:名)?\s*(?:为|是)?\s*[:：]\s*" + IO_VALUE,
+    r"输出文件(?:名)\s*(?:为|是)\s*" + IO_VALUE,
+    r"输出文件(?:名)?\s+" + IO_VALUE,          # 表格里：输出文件 | seed.out
+    r"输出(?:到|至|入)\s*文件\s*" + IO_VALUE,
+    r"(?:output|out)\s*file(?:name)?\s*(?:is)?\s*[:：]\s*" + IO_VALUE,
+)
+
+
+def _io_find(text, patterns):
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, re.I):
+            value = (m.group(1) or "").strip().strip(".,;，。；:：`'\"")
+            if not value or value in IO_SKIP_WORDS:
+                continue
+            # 文件名基本是 ASCII；这样能滤掉「输入文件格式」「输入文件如下」这类中文
+            if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", value):
+                continue
+            if any(word in value for word in IO_SKIP_WORDS):
+                continue
+            return value
+    return ""
+
+
+def detect_io(markdown=None, html=None):
+    """从题面猜输入输出：先看页面 HTML，再看 markdown。
+
+    返回 {'mode': 'file'|'stdin', 'input': ..., 'output': ...}
+    """
+    sources = [text for text in (html_plain_text(html) if html else "", markdown or "") if text]
+    infile = outfile = ""
+    for text in sources:
+        infile = infile or _io_find(text, IO_IN_PATTERNS)
+        outfile = outfile or _io_find(text, IO_OUT_PATTERNS)
+        if infile and outfile:
+            break
+
     if infile and not outfile:
         outfile = os.path.splitext(infile)[0] + ".out"
     elif outfile and not infile:
         infile = os.path.splitext(outfile)[0] + ".in"
     if not infile and not outfile:
         return {"mode": "stdin", "input": "", "output": ""}
+    # 文件名里不该有「/」以外的路径成分，统一取基名，避免拼到临时目录外
+    infile = os.path.basename(infile.replace("\\", "/"))
+    outfile = os.path.basename(outfile.replace("\\", "/"))
     return {"mode": "file", "input": infile, "output": outfile}
 
 
@@ -348,20 +387,29 @@ def io_freopen(io):
 
 
 def problem_io(folder):
-    """读本地题目目录 meta.json 里记录的输入输出方式。"""
+    """读本地题目目录 meta.json 里记录的输入输出方式；旧目录没记录就现场从 statement.md 猜。"""
     fallback = {"mode": "stdin", "input": "", "output": ""}
     if not folder:
         return fallback
     path = os.path.join(folder, "meta.json")
-    if not os.path.exists(path):
-        return fallback
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return fallback
-    io = data.get("io")
-    return io if isinstance(io, dict) and io.get("mode") else fallback
+    io = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            io = data.get("io")
+        except (OSError, ValueError):
+            io = None
+    if isinstance(io, dict) and io.get("mode"):
+        return io
+    statement = os.path.join(folder, "statement.md")
+    if os.path.exists(statement):
+        try:
+            with open(statement, encoding="utf-8") as f:
+                return detect_io(f.read())
+        except OSError:
+            pass
+    return fallback
 
 
 def render_template(text, values):
@@ -426,6 +474,15 @@ def resolve_problem(client, token):
     query = as_no.group(2) if as_no else token
     results = search_problems(client, query)
     if not results:
+        # 未登录时站点搜索照样返回 success 但 0 条，很容易被误判成「题目不存在」
+        logged = True
+        try:
+            logged, _ = client.whoami()
+        except RuntimeError:
+            pass
+        if not logged:
+            raise RuntimeError("未登录（或会话已过期），站点搜索对未登录用户返回空结果；"
+                               "先执行 login 再试")
         raise RuntimeError(f"没有匹配的题目：{token}")
 
     if as_no:
@@ -471,6 +528,8 @@ class Client:
         self.base = f"https://{self.host}:{self.port}"
         self.username = None
         self.session_key = f"{self.host}:{self.port}"
+        # 为 False 时请求不会把当前 cookie 写回配置（用于「先验证再保存」的场景）
+        self.autosave = True
         # 旧版本的独立会话文件（启动时自动迁移进 config.json）
         self.legacy_session_file = os.path.join(BASE_DIR, f"session_{self.host}_{self.port}.json")
         self.s = requests.Session()
@@ -480,10 +539,18 @@ class Client:
         })
 
     # ---------- 会话 ----------
+    def _put_cookies(self, cookies):
+        """按站点域名放 cookie：直接 update(dict) 会生成无域名版本，
+        和服务端下发的同名 cookie 并存，请求头里会出现两个 connect.sid（旧的在前）。"""
+        for name, value in (cookies or {}).items():
+            if name and value:
+                self.s.cookies.set(name, value, domain=self.host, path="/")
+
     def load_session(self):
         entry = (load_config().get("sessions") or {}).get(self.session_key)
         if isinstance(entry, dict) and entry.get("cookies"):
-            self.s.cookies.update(entry["cookies"])
+            self.s.cookies.clear()
+            self._put_cookies(entry["cookies"])
             self.username = entry.get("username")
             return True
 
@@ -494,7 +561,8 @@ class Client:
             except (OSError, ValueError):
                 data = {}
             if data.get("cookies"):
-                self.s.cookies.update(data["cookies"])
+                self.s.cookies.clear()
+                self._put_cookies(data["cookies"])
                 self.username = data.get("username")
                 self.save_session()
                 try:
@@ -512,9 +580,15 @@ class Client:
         sessions = cfg.get("sessions")
         if not isinstance(sessions, dict):
             sessions = {}
+        fresh = requests.utils.dict_from_cookiejar(self.s.cookies)
+        old = (sessions.get(self.session_key) or {}).get("cookies") or {}
+        # 服务端有时会回一个空的 set-cookie（例如 login=;），别用它盖掉本地已有的值
+        for name, value in old.items():
+            if value and not fresh.get(name):
+                fresh[name] = value
         sessions[self.session_key] = {
-            "username": self.username,
-            "cookies": requests.utils.dict_from_cookiejar(self.s.cookies),
+            "username": self.username or (sessions.get(self.session_key) or {}).get("username"),
+            "cookies": fresh,
             "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         cfg["sessions"] = sessions
@@ -533,14 +607,16 @@ class Client:
             save_config(cfg)
 
     # ---------- 请求 ----------
-    def request(self, method, path, data=None, params=None, files=None, json=None, allow_redirects=True):
+    def request(self, method, path, data=None, params=None, files=None, json=None,
+                allow_redirects=True, headers=None):
         url = path if path.startswith("http") else self.base + path
         try:
             r = self.s.request(method.upper(), url, data=data, params=params, files=files, json=json,
-                               timeout=self.timeout, allow_redirects=allow_redirects)
+                               headers=headers, timeout=self.timeout, allow_redirects=allow_redirects)
         except requests.RequestException as exc:
             raise RuntimeError(f"请求失败: {type(exc).__name__}: {exc}") from exc
-        self.save_session()
+        if self.autosave:
+            self.save_session()
         return r
 
     def get(self, path, **kw):
@@ -552,7 +628,18 @@ class Client:
     # ---------- 登录 ----------
     def login(self, username, password):
         digest = hashlib.md5((password + PASSWORD_SALT).encode()).hexdigest()
-        r = self.post("/api/login", data={"username": username, "password": digest})
+        r = self.post("/api/login", data={"username": username, "password": digest},
+                      headers={
+                          "X-Requested-With": "XMLHttpRequest",
+                          "Accept": "application/json, text/javascript, */*; q=0.01",
+                          "Referer": f"{self.base}/login",
+                          "Origin": self.base,
+                      })
+        self.last_login_response = {
+            "status": r.status_code,
+            "set_cookie": r.headers.get("Set-Cookie") or "",
+            "content_type": r.headers.get("Content-Type") or "",
+        }
         try:
             data = r.json()
         except ValueError:
@@ -560,6 +647,11 @@ class Client:
         code = data.get("error_code")
         if code in (None, 1, "1"):
             self.username = username
+            # 页面登录成功后浏览器会把 data.session_id 存成 login cookie，命令行也得自己写
+            session_id = data.get("session_id")
+            if session_id:
+                self.s.cookies.set("login", str(session_id), domain=self.host, path="/")
+            self.last_login_fields = sorted(str(k) for k in data.keys())
             self.save_session()
             return True, "登录成功"
         return False, ERRORS.get(code, f"登录失败，error_code={code}（{data}）")
@@ -575,6 +667,7 @@ class Client:
     def problem_meta(self, pid):
         r = self.get(f"/problem/{pid}")
         html = r.text
+        self._last_problem_html = {"pid": str(pid), "html": html}
         if "错误 - 7FA4" in (re.findall(r"<title>(.*?)</title>", html, re.S) or [""])[0]:
             raise RuntimeError(f"题目 {pid} 不存在或无权访问（请确认已登录）")
         title = re.findall(r"<title>(.*?)</title>", html, re.S)[0]
@@ -607,6 +700,30 @@ class Client:
         m = re.search(r"<pre[^>]*>([\s\S]*)</pre>", r.text)
         text = htmllib.unescape(m.group(1) if m else r.text)
         return text.replace("\r\n", "\n").strip("\n")
+
+    def problem_html(self, pid):
+        """题目页 HTML，problem_meta 取过的就复用，避免重复请求。"""
+        cached = getattr(self, "_last_problem_html", None)
+        if cached and cached.get("pid") == str(pid):
+            return cached["html"]
+        html = self.get(f"/problem/{pid}").text
+        self._last_problem_html = {"pid": str(pid), "html": html}
+        return html
+
+    def problem_rendered_markdown(self, pid, html=None):
+        """把渲染后的题面 HTML 转回 markdown（题面源码有误时以它为准）。"""
+        page = html or self.problem_html(pid)
+        if "错误 - 7FA4" in page and "请登录" in page:
+            raise RuntimeError(f"题目 {pid} 需要登录后才能查看")
+        text = html_to_text(extract_statement_html(page))
+        if len(text) < 40:
+            raise RuntimeError("渲染后的题面为空")
+        # 容器没定位对时会混进提交表单/统计等信息，这种结果不如直接用源码
+        noisy = sum(word in text for word in
+                    ("提交代码", "评测记录", "相关文件", "题目信息", "我的提交", "题解"))
+        if noisy >= 2:
+            raise RuntimeError("HTML 里没定位到题面正文")
+        return text
 
     def problem_additional_zip(self, pid):
         """相关文件 / 样例压缩包，没有则返回 None。"""
@@ -749,16 +866,110 @@ def vjudge_url(oj, prob):
 
 
 def html_to_text(html):
+    """把渲染后的题面 HTML 转成 markdown（标题/列表/代码块/表格/公式尽量保留）。"""
     text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", html or "")
+
+    # MathJax 会把公式渲染成一大坨 SVG，只保留 <title> 里的原始 TeX
+    text = re.sub(r"(?is)<span class=\"mjpage\">[\s\S]*?<title[^>]*>([\s\S]*?)</title>[\s\S]*?</span>",
+                  lambda m: "$%s$" % strip_tags(m.group(1)), text)
+
     # 图片保留成 markdown，方便后面下载成本地文件
     text = re.sub(r"(?is)<img[^>]*src=\"([^\"]+)\"[^>]*>",
                   lambda m: f"\n![图片]({htmllib.unescape(m.group(1))})\n", text)
+
+    # 代码块：内容去掉标签后包进 ``` 栅栏（源码里的换行要保留，先挖出来占位）
+    stash = []
+
+    def code_block(match):
+        body = re.sub(r"(?is)<br\s*/?>", "\n", match.group(1))
+        body = re.sub(r"<[^>]+>", "", body)
+        body = htmllib.unescape(body).strip("\n")
+        stash.append("```\n%s\n```" % body)
+        return "\n\x00CODE%d\x00\n" % (len(stash) - 1)
+
+    text = re.sub(r"(?is)<pre[^>]*>([\s\S]*?)</pre>", code_block, text)
+
+    # 其余部分把源码里的换行/缩进折成空格，否则 SVG 这类多行标签会把一行文字拆散
+    text = re.sub(r"[ \t\r\n]+", " ", text)
+
+    # 行内代码
+    text = re.sub(r"(?is)<code[^>]*>([\s\S]*?)</code>",
+                  lambda m: "`%s`" % strip_tags(m.group(1)), text)
+
+    # 标题：h1 -> #，h2 -> ## …（题面里 h1 一般是题目名，降一级更贴合原来的结构）
+    for level in range(1, 7):
+        pattern = re.compile(r"(?is)<h%d[^>]*>([\s\S]*?)</h%d>" % (level, level))
+
+        def head(match, lv=level):
+            title = strip_tags(match.group(1))
+            return "\n%s %s\n" % ("#" * min(lv, 6), title) if title else ""
+
+        text = pattern.sub(head, text)
+
+    text = re.sub(r"(?i)<li[^>]*>", "\n- ", text)
+    text = re.sub(r"(?i)</t[dh]>", " | ", text)
+    text = re.sub(r"(?i)</tr>", "\n", text)
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</(p|div|h[1-6]|tr|li|pre)>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|h[1-6]|tr|li|pre|table|blockquote)>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = htmllib.unescape(text)
     text = re.sub(r"[ \t\u00a0]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+
+    # 把之前挖出来的代码块放回去
+    text = re.sub(r"\x00CODE(\d+)\x00", lambda m: "\n" + stash[int(m.group(1))] + "\n", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# 题面正文容器（不同版本模板的写法都试一遍）
+STATEMENT_CONTAINERS = (
+    r'<div[^>]*id="problem-content"[^>]*>',
+    r'<div[^>]*class="[^"]*markdown-body[^"]*"[^>]*>',
+    r'<div[^>]*class="[^"]*problem-statement[^"]*"[^>]*>',
+    r'<div[^>]*class="[^"]*ui bottom attached segment[^"]*"[^>]*>',
+    r'<div[^>]*class="[^"]*\bstatement\b[^"]*"[^>]*>',
+)
+
+
+def extract_balanced_div(html, start):
+    """start 指向某个 '<div'，返回该 div 的内部 HTML（自己删掉，嵌套正确配对）。"""
+    tag_re = re.compile(r"<div\b[^>]*>|</div\s*>", re.I)
+    m = tag_re.match(html, start)
+    if not m:
+        return ""
+    inner_start = m.end()
+    depth = 1
+    pos = inner_start
+    while depth:
+        m = tag_re.search(html, pos)
+        if not m:
+            return html[inner_start:]
+        if m.group(0).lower().startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return html[inner_start:m.start()]
+        else:
+            depth += 1
+        pos = m.end()
+    return ""
+
+
+def extract_statement_html(html):
+    """从题目页 HTML 里取题面正文；取不到就返回整页（调用方再兜底）。"""
+    html = html or ""
+    for pattern in STATEMENT_CONTAINERS:
+        m = re.search(pattern, html, re.I)
+        if not m:
+            continue
+        fragment = extract_balanced_div(html, m.start())
+        if len(strip_tags(fragment)) > 40:
+            return fragment
+
+    # 兜底：去掉导航栏、提交表单、脚本，剩下的正文一起转
+    body = re.sub(r"(?is)<div[^>]*class=\"[^\"]*\bui menu\b[^\"]*\"[^>]*>[\s\S]*?</div>\s*</div>", " ", html)
+    body = re.sub(r"(?is)<form[^>]*id=\"submit_code\"[^>]*>[\s\S]*?</form>", " ", body)
+    body = re.sub(r"(?is)<div[^>]*class=\"[^\"]*ui main container[^\"]*\"[^>]*>", " ", body)
+    return body
 
 
 VJ_SECTION_NAMES = {
@@ -1008,18 +1219,102 @@ def pick_language(meta, wanted):
 
 
 # ---------------------------------------------------------------- 命令
+def parse_cookie_text(text):
+    """解析 Cookie：'a=1; b=2'、多行 a=1，以及「下载当前凭证」的 YAML（key: value）。"""
+    cookies = {}
+    for raw in (text or "").splitlines() or []:
+        line = raw.strip().rstrip(";")
+        if not line or line.startswith("#") or line.startswith("---"):
+            continue
+        if line.lower().startswith("cookie:"):
+            line = line.split(":", 1)[1].strip()
+        for chunk in line.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            m = re.match(r"^([A-Za-z0-9_.\-]+)\s*[:=]\s*(\S.*)$", chunk)
+            if m:
+                name = m.group(1).strip()
+                value = m.group(2).strip().strip('"\'')
+                if name.lower() not in ("cookie", "path", "domain", "expires", "httponly",
+                                        "secure", "samesite", "max-age"):
+                    cookies[name] = value
+    return cookies
+
+
 def cmd_login(args):
     client = make_client(args)
     client.load_session()
+
+    # 用浏览器里的 Cookie / 「下载当前凭证」导入，绕过密码登录（有验证码时最省事）
+    if getattr(args, "cookie", None) or getattr(args, "cookie_file", None):
+        if args.cookie_file:
+            if not os.path.exists(args.cookie_file):
+                print(f"[错误] 文件不存在：{args.cookie_file}")
+                return 1
+            text = read_text_any(args.cookie_file)
+        else:
+            text = args.cookie
+        cookies = parse_cookie_text(text)
+        if not cookies:
+            print("[错误] 没解析出 Cookie（需要形如 login=xxx; connect.sid=yyy）")
+            return 1
+        # 先关掉自动保存：验证失败时绝不覆盖掉现有的有效会话
+        client.autosave = False
+        client.s.cookies.clear()
+        client._put_cookies(cookies)
+        print(f"[Cookie] 导入 {len(cookies)} 项：{', '.join(sorted(cookies))}")
+        logged, _ = client.whoami()
+        client.autosave = True
+        if not logged:
+            print("[失败] Cookie 无效或已过期（站点会返回 登录 按钮），已保留原会话")
+            return 1
+        client.save_session()
+        print(f"[OK] 已登录（{client.username or cookies.get('login', '')[:8]}）")
+        return 0
+
     user = args.user or input("用户名: ")
     pwd = args.password if args.password is not None else getpass.getpass("密码: ")
+    client.autosave = False          # 登录失败时不把响应里的空 cookie 写回配置
     ok, msg = client.login(user, pwd)
     print(("[OK] " if ok else "[失败] ") + msg)
     if not ok:
+        print("[保留] 本地会话未改动")
         return 1
+    client.autosave = True
     logged, _ = client.whoami()
-    print(f"[校验] 会话{'有效' if logged else '无效（可能被风控/需要验证码）'}")
-    return 0
+    if logged:
+        print("[校验] 会话有效")
+        jar = requests.utils.dict_from_cookiejar(client.s.cookies)
+        print("[会话] " + ", ".join(f"{k}({len(v)})" for k, v in sorted(jar.items())))
+        # 用「新进程等价」的干净客户端复验一次：能抓住「当前进程有效、下次失效」的情况
+        try:
+            fresh = make_client(args)
+            fresh.load_session()
+            relogged, _ = fresh.whoami()
+            print(f"[复验] 重新加载配置后：{'有效' if relogged else '无效（cookie 没存好）'}")
+        except RuntimeError:
+            pass
+        if len(jar.get("login") or "") < 16:
+            print("[警告] 站点没有下发有效的 login cookie，换个进程可能就不认账了")
+            info = getattr(client, "last_login_response", {}) or {}
+            print(f"[诊断] /api/login 状态 {info.get('status')}  "
+                  f"Set-Cookie: {(info.get('set_cookie') or '（无）')[:160]}")
+            fields = getattr(client, "last_login_fields", [])
+            if fields:
+                print("[诊断] 登录接口返回字段：" + ", ".join(fields))
+            try:
+                html = client.get("/").text
+                print(f"[诊断] 首页标记：/logout={'/logout' in html}  退出={'退出' in html}  "
+                      f"登录={'登录' in html}")
+            except RuntimeError:
+                pass
+        return 0
+    print("[校验] 会话无效：站点没有下发可用的 login cookie（可能是验证码/风控，或账号被限制）")
+    print("[建议] 在浏览器登录后导入 Cookie：")
+    print('       login --cookie "login=...; connect.sid=..."')
+    print("       站点右上角「下载当前凭证」得到 YAML 的话：login --cookie-file 凭证.yaml")
+    return 1
 
 
 def cmd_logout(args):
@@ -1039,6 +1334,12 @@ def cmd_whoami(args):
         return 1
     print(f"[站点] {client.base}")
     print(f"[状态] {'已登录' if logged else '未登录'}" + (f"（{client.username}）" if client.username else ""))
+    jar = requests.utils.dict_from_cookiejar(client.s.cookies)
+    print("[会话] " + (", ".join(f"{k}({len(v)})" for k, v in sorted(jar.items())) or "（空）"))
+    if not jar:
+        print("[提示] 本地没有会话，先执行 login")
+    elif len(jar.get("login") or "") < 16:
+        print("[提示] 缺少有效的 login cookie（站点登录凭证就是它），用 login 重新登录")
     return 0 if logged else 1
 
 
@@ -1064,6 +1365,14 @@ def cmd_list(args):
             if low == wanted or low.startswith(wanted + "."):
                 rows.append((no, title, str(item["value"])))
         if not rows:
+            logged = True
+            try:
+                logged, _ = client.whoami()
+            except RuntimeError:
+                pass
+            if not logged:
+                print("[错误] 未登录（或会话已过期），站点搜索对未登录用户返回空结果；先执行 login")
+                return 1
             print(f"[提示] 章节号 {args.path} 下没有题目")
             return 1
         rows.sort(key=lambda x: no_sort_key(x[0]))
@@ -1108,6 +1417,7 @@ def cmd_statement(args):
     try:
         pid, label = resolve_problem(client, args.id)
         meta = client.problem_meta(pid)
+        page_html = "" if meta.get("foreign") else client.problem_html(pid)
         markdown = client.problem_markdown(pid)
         if meta.get("foreign") and not markdown.strip():
             oj, prob = parse_foreign(meta["foreign"])
@@ -1118,6 +1428,13 @@ def cmd_statement(args):
                     print(f"[外站] 题面来自 vjudge：{vj['url']}")
                 except RuntimeError as exc:
                     print(f"[外站] {exc}")
+        if not meta.get("foreign") and not getattr(args, "from_md", False):
+            try:
+                rendered = client.problem_rendered_markdown(pid, page_html)
+                if len(rendered) >= 40:
+                    markdown = rendered
+            except RuntimeError:
+                pass
         print(f"[题目] {meta['title'] if label == str(pid) else label}  ({meta['url']})")
         limits = " / ".join(filter(None, [meta["type"], meta["judge"], meta["time"], meta["memory"]]))
         if limits:
@@ -1138,6 +1455,7 @@ def cmd_pull(args):
     try:
         pid, label = resolve_problem(client, args.id)
         meta = client.problem_meta(pid)
+        page_html = "" if meta.get("foreign") else client.problem_html(pid)
         markdown = client.problem_markdown(pid)
     except RuntimeError as exc:
         print(f"[错误] {exc}")
@@ -1145,6 +1463,17 @@ def cmd_pull(args):
 
     if label == str(pid):
         label = meta["title"]
+
+    # 题面源码（markdown）可能本身有误：优先用渲染后的 HTML，失败再退回源码
+    from_source = "markdown 源码"
+    if not meta.get("foreign") and not getattr(args, "from_md", False):
+        try:
+            rendered = client.problem_rendered_markdown(pid, page_html)
+            if len(rendered) >= 40:
+                markdown = rendered
+                from_source = "渲染后的 HTML"
+        except RuntimeError as exc:
+            print(f"[题面] 退回 markdown 源码（{exc}）")
 
     # 外站题：题面从 vjudge 取（需要 vj_cookie）
     vj_samples, vj_url, vj_note = {}, "", ""
@@ -1201,7 +1530,7 @@ def cmd_pull(args):
                 unzipped.append(os.path.basename(name))
     # 4) C++ 文件（用自定义模板，没配置则用内置模板）
     no, title = split_problem_name(label)
-    io_info = detect_io(markdown)
+    io_info = detect_io(markdown, html=page_html)
     cpp_path = os.path.join(folder, f"{short}.cpp")
     created = False
     if args.force or not os.path.exists(cpp_path):
@@ -1233,6 +1562,9 @@ def cmd_pull(args):
         tpl_desc = tpl_file or "内置模板"
     else:
         tpl_desc = ""
+        if io_info.get("mode") == "file" and "freopen" not in read_text_any(cpp_path):
+            print(f"[提示] 这是文件 IO 题（{io_info.get('input')}），但 {os.path.basename(cpp_path)} 里没有 freopen；"
+                  f"用 pull {args.id} -f 可以按模板重新生成")
     # 5) 元信息
     meta_out = dict(meta)
     meta_out.update({"no": no, "short": short, "cpp": os.path.relpath(cpp_path),
@@ -1253,7 +1585,7 @@ def cmd_pull(args):
         print("-" * 60)
 
     print(f"[目录] {folder}")
-    print(f"[题面] statement.md")
+    print(f"[题面] statement.md（来源：{from_source}）")
     if io_info.get("mode") == "file":
         print(f"[输入输出] 文件：{io_info.get('input')} -> {io_info.get('output')}（模板里的 {{{{freopen}}}} 已填好）")
     else:
@@ -4931,9 +5263,12 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="action", metavar="<命令>")
 
-    p = sub.add_parser("login", parents=[common, cfgopt], help="登录并保存会话")
+    p = sub.add_parser("login", parents=[common, cfgopt],
+                       help="登录并保存会话（也可用 --cookie 导入浏览器 Cookie）")
     p.add_argument("-u", "--user", help="用户名（不填则提示输入）")
     p.add_argument("-p", "--password", help="密码（不填则安全输入）")
+    p.add_argument("--cookie", help='直接给 Cookie 串，如 "login=xxx; connect.sid=yyy"')
+    p.add_argument("--cookie-file", help="从文件读 Cookie（支持站点「下载当前凭证」的 YAML）")
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("logout", parents=[common, cfgopt], help="清除本地会话")
@@ -4952,10 +5287,12 @@ def build_parser():
     p.add_argument("-q", "--quiet", action="store_true", help="不打印题面，只下载文件")
     p.add_argument("-t", "--template", help="本次使用的模板文件（默认用 config.json 里设置的）")
     p.add_argument("--vj-cookie", help="vjudge 的 Cookie（拉外站题面用，默认读 config.json 的 vj_cookie）")
+    p.add_argument("--from-md", action="store_true", help="题面用 markdown 源码（默认用渲染后的 HTML）")
     p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("statement", parents=[common, cfgopt], help="只显示题面")
     p.add_argument("id", help="题目 ID 或题号（Q6.4.6.1 / 6.4.6.1）")
+    p.add_argument("--from-md", action="store_true", help="题面用 markdown 源码（默认用渲染后的 HTML）")
     p.set_defaults(func=cmd_statement)
 
     p = sub.add_parser("run", parents=[common, cfgopt], help="编译并在样例上运行（本地对拍）")

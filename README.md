@@ -13,8 +13,8 @@
 | --- | --- |
 | `login` / `logout` / `whoami` | 登录 `jx.7fa4.cn` / `in.7fa4.cn`（自动探测可用站点）、退出、查看状态 |
 | `list [章节]` | 题目列表，支持 `list 6.5.5` 这种章节号 |
-| `pull <题>` | 拉题面 + 图片 + 样例（自动解压 zip），生成 C++ 文件 |
-| `statement <题>` | 只看题面 |
+| `pull <题>` | 拉题面 + 图片 + 样例（自动解压 zip），生成 C++ 文件；题面默认取**渲染后的 HTML**（`--from-md` 用 markdown 源码） |
+| `statement <题>` | 只看题面（同样默认走渲染后的 HTML） |
 | `submit <题>` | 提交代码并自动跟进评测结果；外站题直连 vjudge，AC 后才同步到 7FA4（`--via 7fa4` 走代理），`--no-watch` 不跟进 |
 | `push <题>` | 把 vjudge 上已 AC 的记录同步到 7FA4，不重复提交 |
 | `vjlogin` / `vjcheck` | 用账号密码登录 vjudge / 检查会话是否有效 |
@@ -192,6 +192,31 @@ python 7fa4_terminal.py --help
 「求助 / 同意求助」都是普通文本消息加固定前缀（`【求助】` / `【同意求助】`），站点没有专门的求助消息类型，
 所以对方在网页上看到的就是一条带前缀的聊天记录。
 
+## 题面来源：优先渲染后的 HTML
+
+站点的 `/problem/<id>/markdown/html` 返回的是**作者写的 markdown 源码**，有时本身就有错（漏段落、公式没闭合等）。
+所以 `pull` / `statement` 现在默认：
+
+1. 取题目页 `/problem/<id>` 渲染后的 HTML；
+2. 在 HTML 里找题面容器（`#problem-content` / `.markdown-body` / `.problem-statement` /
+   `.ui.bottom.attached.segment` / `.statement`，按顺序试），用**配对 div** 的方式截出正文；
+3. 把正文 HTML 转回 markdown：`<h1..h6>` → `#..######`、`<pre>` → 围栏代码块、
+   `<code>` → 行内反引号、`<li>` → `- `、表格单元格用 ` | ` 分隔、`<img>` → `![](url)`；
+   MathJax 渲染出来的 `<span class="mjpage"><svg>…` 只取 `<title>` 里的 TeX，还原成 `$n$`、`$1 \le n \le 9$`；
+   源码里的换行/缩进会先折成空格（`<pre>` 内容先挖出来占位），否则 SVG 这种多行标签会把一句话拆成好几行；
+4. 如果容器没定位到（提取结果里出现「提交代码/评测记录/我的提交」这类噪声 ≥2 处）或正文太短，
+   自动回退到 markdown 源码。
+
+`pull` 会打印来源，方便确认：
+
+```
+$ 7fa4 pull 82606
+[题面] statement.md（来源：渲染后的 HTML）
+[输入输出] 文件：xxx.in -> xxx.out
+```
+
+需要旧行为时加 `--from-md`（只看源码）。
+
 ## 文件输入输出
 
 有些题要求读写文件（`freopen`），`pull` 会从题面里认出来并写进 `meta.json`：
@@ -201,8 +226,18 @@ python 7fa4_terminal.py --help
 # [输入输出] 文件：data.in -> data.out（模板里的 {{freopen}} 已填好）
 ```
 
-识别规则：`输入文件：x.in` / `输入文件名为 x.in` / `从文件 x.in 读入` / `Input file: x.in`，
-输出同理；只写一边时另一边按扩展名推导（`.in ↔ .out`）。
+识别规则（**先看题目页 HTML，再看 markdown 源**）：
+
+- `输入文件：x.in` / `输入文件名：x.in` / `输入文件名为 x.in`
+- 表格里分成两格：`<td>输入文件</td><td>x.in</td>`
+- `从文件 x.in 读入` / `Input file: x.in`
+- 输出同理；只写一边时另一边按扩展名推导（`.in ↔ .out`）
+
+文件名要求是 ASCII（`[A-Za-z0-9_.-]`），所以「输入文件格式如下」「输入文件说明」这类不会被误判。
+有些题只把这句话写在题目页 HTML 里（markdown 源里没有），现在两边都会查。
+
+已经 pull 过的题目：`meta.json` 里没有 `io` 时，`run`/`stress` 会现场从 `statement.md` 再猜一次；
+如果代码是旧的（没 `freopen`），`pull <题> -f` 按模板重新生成带 `{{freopen}}` 的版本。
 
 模板里加一行 `{{freopen}}` 即可自动插入：
 
